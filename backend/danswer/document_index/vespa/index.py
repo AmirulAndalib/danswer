@@ -24,8 +24,6 @@ from danswer.configs.app_configs import VESPA_HOST
 from danswer.configs.app_configs import VESPA_PORT
 from danswer.configs.app_configs import VESPA_TENANT_PORT
 from danswer.configs.chat_configs import DOC_TIME_DECAY
-from danswer.configs.chat_configs import EDIT_KEYWORD_QUERY
-from danswer.configs.chat_configs import HYBRID_ALPHA
 from danswer.configs.chat_configs import NUM_RETURNED_HITS
 from danswer.configs.chat_configs import TITLE_CONTENT_RATIO
 from danswer.configs.constants import ACCESS_CONTROL_LIST
@@ -41,6 +39,7 @@ from danswer.configs.constants import HIDDEN
 from danswer.configs.constants import INDEX_SEPARATOR
 from danswer.configs.constants import METADATA
 from danswer.configs.constants import METADATA_LIST
+from danswer.configs.constants import METADATA_SUFFIX
 from danswer.configs.constants import PRIMARY_OWNERS
 from danswer.configs.constants import RECENCY_BIAS
 from danswer.configs.constants import SECONDARY_OWNERS
@@ -51,8 +50,6 @@ from danswer.configs.constants import SOURCE_LINKS
 from danswer.configs.constants import SOURCE_TYPE
 from danswer.configs.constants import TITLE
 from danswer.configs.constants import TITLE_EMBEDDING
-from danswer.configs.constants import TITLE_SEPARATOR
-from danswer.configs.model_configs import SEARCH_DISTANCE_CUTOFF
 from danswer.connectors.cross_connector_utils.miscellaneous_utils import (
     get_experts_stores_representations,
 )
@@ -64,11 +61,10 @@ from danswer.document_index.vespa.utils import remove_invalid_unicode_chars
 from danswer.document_index.vespa.utils import replace_invalid_doc_id_characters
 from danswer.indexing.models import DocMetadataAwareIndexChunk
 from danswer.search.models import IndexFilters
-from danswer.search.models import InferenceChunk
-from danswer.search.retrieval.search_runner import query_processing
-from danswer.search.retrieval.search_runner import remove_stop_words_and_punctuation
+from danswer.search.models import InferenceChunkUncleaned
 from danswer.utils.batching import batch_generator
 from danswer.utils.logger import setup_logger
+from shared_configs.model_server_models import Embedding
 
 logger = setup_logger()
 
@@ -119,6 +115,7 @@ def _does_document_exist(
     chunk. This checks for whether the chunk exists already in the index"""
     doc_url = f"{DOCUMENT_ID_ENDPOINT.format(index_name=index_name)}/{doc_chunk_id}"
     doc_fetch_response = http_client.get(doc_url)
+
     if doc_fetch_response.status_code == 404:
         return False
 
@@ -328,11 +325,13 @@ def _index_vespa_chunk(
         "Content-Type": "application/json",
     }
     document = chunk.source_document
+
     # No minichunk documents in vespa, minichunk vectors are stored in the chunk itself
     vespa_chunk_id = str(get_uuid_from_chunk(chunk))
-
     embeddings = chunk.embeddings
+
     embeddings_name_vector_map = {"full_chunk": embeddings.full_embedding}
+
     if embeddings.mini_chunk_embeddings:
         for ind, m_c_embed in enumerate(embeddings.mini_chunk_embeddings):
             embeddings_name_vector_map[f"mini_chunk_{ind}"] = m_c_embed
@@ -345,8 +344,14 @@ def _index_vespa_chunk(
         BLURB: remove_invalid_unicode_chars(chunk.blurb),
         TITLE: remove_invalid_unicode_chars(title) if title else None,
         SKIP_TITLE_EMBEDDING: not title,
-        CONTENT: remove_invalid_unicode_chars(chunk.content),
-        # This duplication of `content` is needed for keyword highlighting :(
+        # For the BM25 index, the keyword suffix is used, the vector is already generated with the more
+        # natural language representation of the metadata section
+        CONTENT: remove_invalid_unicode_chars(
+            f"{chunk.title_prefix}{chunk.content}{chunk.metadata_suffix_keyword}"
+        ),
+        # This duplication of `content` is needed for keyword highlighting
+        # Note that it's not exactly the same as the actual content
+        # which contains the title prefix and metadata suffix
         CONTENT_SUMMARY: remove_invalid_unicode_chars(chunk.content),
         SOURCE_TYPE: str(document.source.value),
         SOURCE_LINKS: json.dumps(chunk.source_links),
@@ -355,6 +360,7 @@ def _index_vespa_chunk(
         METADATA: json.dumps(document.metadata),
         # Save as a list for efficient extraction as an Attribute
         METADATA_LIST: chunk.source_document.get_metadata_str_attributes(),
+        METADATA_SUFFIX: chunk.metadata_suffix_keyword,
         EMBEDDINGS: embeddings_name_vector_map,
         TITLE_EMBEDDING: chunk.title_embedding,
         BOOST: chunk.boost,
@@ -559,7 +565,9 @@ def _process_dynamic_summary(
     return processed_summary
 
 
-def _vespa_hit_to_inference_chunk(hit: dict[str, Any]) -> InferenceChunk:
+def _vespa_hit_to_inference_chunk(
+    hit: dict[str, Any], null_score: bool = False
+) -> InferenceChunkUncleaned:
     fields = cast(dict[str, Any], hit["fields"])
 
     # parse fields that are stored as strings, but are really json / datetime
@@ -582,19 +590,6 @@ def _vespa_hit_to_inference_chunk(hit: dict[str, Any]) -> InferenceChunk:
             f"Chunk with blurb: {fields.get(BLURB, 'Unknown')[:50]}... has no Semantic Identifier"
         )
 
-    # Remove the title from the first chunk as every chunk already included
-    # its semantic identifier for LLM
-    content = fields[CONTENT]
-    if fields[CHUNK_ID] == 0:
-        parts = content.split(TITLE_SEPARATOR, maxsplit=1)
-        content = parts[1] if len(parts) > 1 and "\n" not in parts[0] else content
-
-    # User ran into this, not sure why this could happen, error checking here
-    blurb = fields.get(BLURB)
-    if not blurb:
-        logger.error(f"Chunk with id {fields.get(semantic_identifier)} ")
-        blurb = ""
-
     source_links = fields.get(SOURCE_LINKS, {})
     source_links_dict_unprocessed = (
         json.loads(source_links) if isinstance(source_links, str) else source_links
@@ -604,29 +599,33 @@ def _vespa_hit_to_inference_chunk(hit: dict[str, Any]) -> InferenceChunk:
         for k, v in cast(dict[str, str], source_links_dict_unprocessed).items()
     }
 
-    return InferenceChunk(
+    return InferenceChunkUncleaned(
         chunk_id=fields[CHUNK_ID],
-        blurb=blurb,
-        content=content,
+        blurb=fields.get(BLURB, ""),  # Unused
+        content=fields[CONTENT],  # Includes extra title prefix and metadata suffix
         source_links=source_links_dict,
         section_continuation=fields[SECTION_CONTINUATION],
         document_id=fields[DOCUMENT_ID],
         source_type=fields[SOURCE_TYPE],
+        title=fields.get(TITLE),
         semantic_identifier=fields[SEMANTIC_IDENTIFIER],
         boost=fields.get(BOOST, 1),
         recency_bias=fields.get("matchfeatures", {}).get(RECENCY_BIAS, 1.0),
-        score=hit.get("relevance", 0),
+        score=None if null_score else hit.get("relevance", 0),
         hidden=fields.get(HIDDEN, False),
         primary_owners=fields.get(PRIMARY_OWNERS),
         secondary_owners=fields.get(SECONDARY_OWNERS),
         metadata=metadata,
+        metadata_suffix=fields.get(METADATA_SUFFIX),
         match_highlights=match_highlights,
         updated_at=updated_at,
     )
 
 
 @retry(tries=3, delay=1, backoff=2)
-def _query_vespa(query_params: Mapping[str, str | int | float]) -> list[InferenceChunk]:
+def _query_vespa(
+    query_params: Mapping[str, str | int | float]
+) -> list[InferenceChunkUncleaned]:
     if "query" in query_params and not cast(str, query_params["query"]).strip():
         raise ValueError("No/empty query received")
 
@@ -681,16 +680,6 @@ def _query_vespa(query_params: Mapping[str, str | int | float]) -> list[Inferenc
     return inference_chunks
 
 
-@retry(tries=3, delay=1, backoff=2)
-def _inference_chunk_by_vespa_id(vespa_id: str, index_name: str) -> InferenceChunk:
-    res = requests.get(
-        f"{DOCUMENT_ID_ENDPOINT.format(index_name=index_name)}/{vespa_id}"
-    )
-    res.raise_for_status()
-
-    return _vespa_hit_to_inference_chunk(res.json())
-
-
 def in_memory_zip_from_file_bytes(file_contents: dict[str, bytes]) -> BinaryIO:
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
@@ -735,6 +724,7 @@ class VespaIndex(DocumentIndex):
         f"{SOURCE_TYPE}, "
         f"{SOURCE_LINKS}, "
         f"{SEMANTIC_IDENTIFIER}, "
+        f"{TITLE}, "
         f"{SECTION_CONTINUATION}, "
         f"{BOOST}, "
         f"{HIDDEN}, "
@@ -742,6 +732,7 @@ class VespaIndex(DocumentIndex):
         f"{PRIMARY_OWNERS}, "
         f"{SECONDARY_OWNERS}, "
         f"{METADATA}, "
+        f"{METADATA_SUFFIX}, "
         f"{CONTENT_SUMMARY} "
         f"from {{index_name}} where "
     )
@@ -977,7 +968,7 @@ class VespaIndex(DocumentIndex):
         min_chunk_ind: int | None,
         max_chunk_ind: int | None,
         user_access_control_list: list[str] | None = None,
-    ) -> list[InferenceChunk]:
+    ) -> list[InferenceChunkUncleaned]:
         document_id = replace_invalid_doc_id_characters(document_id)
 
         vespa_chunks = _get_vespa_chunks_by_document_id(
@@ -992,101 +983,24 @@ class VespaIndex(DocumentIndex):
             return []
 
         inference_chunks = [
-            _vespa_hit_to_inference_chunk(chunk) for chunk in vespa_chunks
+            _vespa_hit_to_inference_chunk(chunk, null_score=True)
+            for chunk in vespa_chunks
         ]
         inference_chunks.sort(key=lambda chunk: chunk.chunk_id)
         return inference_chunks
 
-    def keyword_retrieval(
-        self,
-        query: str,
-        filters: IndexFilters,
-        time_decay_multiplier: float,
-        num_to_retrieve: int = NUM_RETURNED_HITS,
-        offset: int = 0,
-        edit_keyword_query: bool = EDIT_KEYWORD_QUERY,
-    ) -> list[InferenceChunk]:
-        # IMPORTANT: THIS FUNCTION IS NOT UP TO DATE, DOES NOT WORK CORRECTLY
-        vespa_where_clauses = _build_vespa_filters(filters)
-        yql = (
-            VespaIndex.yql_base.format(index_name=self.index_name)
-            + vespa_where_clauses
-            # `({defaultIndex: "content_summary"}userInput(@query))` section is
-            # needed for highlighting while the N-gram highlighting is broken /
-            # not working as desired
-            + '({grammar: "weakAnd"}userInput(@query) '
-            + f'or ({{defaultIndex: "{CONTENT_SUMMARY}"}}userInput(@query)))'
-        )
-
-        final_query = query_processing(query) if edit_keyword_query else query
-
-        params: dict[str, str | int] = {
-            "yql": yql,
-            "query": final_query,
-            "input.query(decay_factor)": str(DOC_TIME_DECAY * time_decay_multiplier),
-            "hits": num_to_retrieve,
-            "offset": offset,
-            "ranking.profile": "keyword_search",
-            "timeout": _VESPA_TIMEOUT,
-        }
-
-        return _query_vespa(params)
-
-    def semantic_retrieval(
-        self,
-        query: str,
-        query_embedding: list[float],
-        filters: IndexFilters,
-        time_decay_multiplier: float,
-        num_to_retrieve: int = NUM_RETURNED_HITS,
-        offset: int = 0,
-        distance_cutoff: float | None = SEARCH_DISTANCE_CUTOFF,
-        edit_keyword_query: bool = EDIT_KEYWORD_QUERY,
-    ) -> list[InferenceChunk]:
-        # IMPORTANT: THIS FUNCTION IS NOT UP TO DATE, DOES NOT WORK CORRECTLY
-        vespa_where_clauses = _build_vespa_filters(filters)
-        yql = (
-            VespaIndex.yql_base.format(index_name=self.index_name)
-            + vespa_where_clauses
-            + f"(({{targetHits: {10 * num_to_retrieve}}}nearestNeighbor(embeddings, query_embedding)) "
-            # `({defaultIndex: "content_summary"}userInput(@query))` section is
-            # needed for highlighting while the N-gram highlighting is broken /
-            # not working as desired
-            + f'or ({{defaultIndex: "{CONTENT_SUMMARY}"}}userInput(@query)))'
-        )
-
-        query_keywords = (
-            " ".join(remove_stop_words_and_punctuation(query))
-            if edit_keyword_query
-            else query
-        )
-
-        params: dict[str, str | int] = {
-            "yql": yql,
-            "query": query_keywords,  # Needed for highlighting
-            "input.query(query_embedding)": str(query_embedding),
-            "input.query(decay_factor)": str(DOC_TIME_DECAY * time_decay_multiplier),
-            "hits": num_to_retrieve,
-            "offset": offset,
-            "ranking.profile": f"hybrid_search{len(query_embedding)}",
-            "timeout": _VESPA_TIMEOUT,
-        }
-
-        return _query_vespa(params)
-
     def hybrid_retrieval(
         self,
         query: str,
-        query_embedding: list[float],
+        query_embedding: Embedding,
+        final_keywords: list[str] | None,
         filters: IndexFilters,
+        hybrid_alpha: float,
         time_decay_multiplier: float,
         num_to_retrieve: int,
         offset: int = 0,
-        hybrid_alpha: float | None = HYBRID_ALPHA,
         title_content_ratio: float | None = TITLE_CONTENT_RATIO,
-        distance_cutoff: float | None = SEARCH_DISTANCE_CUTOFF,
-        edit_keyword_query: bool = EDIT_KEYWORD_QUERY,
-    ) -> list[InferenceChunk]:
+    ) -> list[InferenceChunkUncleaned]:
         vespa_where_clauses = _build_vespa_filters(filters)
         # Needs to be at least as much as the value set in Vespa schema config
         target_hits = max(10 * num_to_retrieve, 1000)
@@ -1099,20 +1013,14 @@ class VespaIndex(DocumentIndex):
             + f'or ({{defaultIndex: "{CONTENT_SUMMARY}"}}userInput(@query)))'
         )
 
-        query_keywords = (
-            " ".join(remove_stop_words_and_punctuation(query))
-            if edit_keyword_query
-            else query
-        )
+        final_query = " ".join(final_keywords) if final_keywords else query
 
         params: dict[str, str | int | float] = {
             "yql": yql,
-            "query": query_keywords,
+            "query": final_query,
             "input.query(query_embedding)": str(query_embedding),
             "input.query(decay_factor)": str(DOC_TIME_DECAY * time_decay_multiplier),
-            "input.query(alpha)": hybrid_alpha
-            if hybrid_alpha is not None
-            else HYBRID_ALPHA,
+            "input.query(alpha)": hybrid_alpha,
             "input.query(title_content_ratio)": title_content_ratio
             if title_content_ratio is not None
             else TITLE_CONTENT_RATIO,
@@ -1130,7 +1038,7 @@ class VespaIndex(DocumentIndex):
         filters: IndexFilters,
         num_to_retrieve: int = NUM_RETURNED_HITS,
         offset: int = 0,
-    ) -> list[InferenceChunk]:
+    ) -> list[InferenceChunkUncleaned]:
         vespa_where_clauses = _build_vespa_filters(filters, include_hidden=True)
         yql = (
             VespaIndex.yql_base.format(index_name=self.index_name)

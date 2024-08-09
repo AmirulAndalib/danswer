@@ -16,6 +16,7 @@ from danswer.configs.constants import MessageType
 from danswer.file_store.models import InMemoryChatFile
 from danswer.llm.override_models import PromptOverride
 from danswer.llm.utils import build_content_with_imgs
+from danswer.tools.models import ToolCallFinalResult
 
 if TYPE_CHECKING:
     from danswer.db.models import ChatMessage
@@ -32,6 +33,7 @@ class PreviousMessage(BaseModel):
     token_count: int
     message_type: MessageType
     files: list[InMemoryChatFile]
+    tool_calls: list[ToolCallFinalResult]
 
     @classmethod
     def from_chat_message(
@@ -48,6 +50,14 @@ class PreviousMessage(BaseModel):
                 file
                 for file in available_files
                 if str(file.file_id) in message_file_ids
+            ],
+            tool_calls=[
+                ToolCallFinalResult(
+                    tool_name=tool_call.tool_name,
+                    tool_args=tool_call.tool_arguments,
+                    tool_result=tool_call.tool_result,
+                )
+                for tool_call in chat_message.tool_calls
             ],
         )
 
@@ -70,9 +80,11 @@ class DocumentPruningConfig(BaseModel):
     # e.g. we don't want to truncate each document to be no more
     # than one chunk long
     is_manually_selected_docs: bool = False
-    # If user specifies to include additional context chunks for each match, then different pruning
+    # If user specifies to include additional context Chunks for each match, then different pruning
     # is used. As many Sections as possible are included, and the last Section is truncated
-    use_sections: bool = False
+    # If this is false, all of the Sections are truncated if they are longer than the expected Chunk size.
+    # Sections are often expected to be longer than the maximum Chunk size but Chunks should not be.
+    use_sections: bool = True
     # If using tools, then we need to consider the tool length
     tool_num_tokens: int = 0
     # If using a tool message to represent the docs, then we have to JSON serialize

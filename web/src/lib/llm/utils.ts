@@ -15,7 +15,14 @@ export function getFinalLLM(
   let model = defaultProvider?.default_model_name || "";
 
   if (persona) {
-    provider = persona.llm_model_provider_override || provider;
+    // Map "provider override" to actual LLLMProvider
+    if (persona.llm_model_provider_override) {
+      const underlyingProvider = llmProviders.find(
+        (item: LLMProviderDescriptor) =>
+          item.name === persona.llm_model_provider_override
+      );
+      provider = underlyingProvider?.provider || provider;
+    }
     model = persona.llm_model_version_override || model;
   }
 
@@ -27,12 +34,42 @@ export function getFinalLLM(
   return [provider, model];
 }
 
+export function getLLMProviderOverrideForPersona(
+  liveAssistant: Persona,
+  llmProviders: LLMProviderDescriptor[]
+): LlmOverride | null {
+  const overrideProvider = liveAssistant.llm_model_provider_override;
+  const overrideModel = liveAssistant.llm_model_version_override;
+
+  if (!overrideModel) {
+    return null;
+  }
+
+  const matchingProvider = llmProviders.find(
+    (provider) =>
+      (overrideProvider ? provider.name === overrideProvider : true) &&
+      provider.model_names.includes(overrideModel)
+  );
+
+  if (matchingProvider) {
+    return {
+      name: matchingProvider.name,
+      provider: matchingProvider.provider,
+      modelName: overrideModel,
+    };
+  }
+
+  return null;
+}
+
 const MODELS_SUPPORTING_IMAGES = [
   ["openai", "gpt-4o"],
+  ["openai", "gpt-4o-mini"],
   ["openai", "gpt-4-vision-preview"],
   ["openai", "gpt-4-turbo"],
   ["openai", "gpt-4-1106-vision-preview"],
   ["azure", "gpt-4o"],
+  ["azure", "gpt-4o-mini"],
   ["azure", "gpt-4-vision-preview"],
   ["azure", "gpt-4-turbo"],
   ["azure", "gpt-4-1106-vision-preview"],

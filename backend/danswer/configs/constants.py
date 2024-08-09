@@ -19,6 +19,7 @@ DOCUMENT_SETS = "document_sets"
 TIME_FILTER = "time_filter"
 METADATA = "metadata"
 METADATA_LIST = "metadata_list"
+METADATA_SUFFIX = "metadata_suffix"
 MATCH_HIGHLIGHTS = "match_highlights"
 # stored in the `metadata` of a chunk. Used to signify that this chunk should
 # not be used for QA. For example, Google Drive file types which can't be parsed
@@ -43,7 +44,7 @@ QUERY_EVENT_ID = "query_event_id"
 LLM_CHUNKS = "llm_chunks"
 
 # For chunking/processing chunks
-TITLE_SEPARATOR = "\n\r\n"
+RETURN_SEPARATOR = "\n\r\n"
 SECTION_SEPARATOR = "\n\n"
 # For combining attributes, doesn't have to be unique/perfect to work
 INDEX_SEPARATOR = "==="
@@ -58,6 +59,14 @@ DISABLED_GEN_AI_MSG = (
     "You can still use Danswer as a search engine."
 )
 
+# Postgres connection constants for application_name
+POSTGRES_WEB_APP_NAME = "web"
+POSTGRES_INDEXER_APP_NAME = "indexer"
+POSTGRES_CELERY_APP_NAME = "celery"
+POSTGRES_CELERY_BEAT_APP_NAME = "celery_beat"
+POSTGRES_CELERY_WORKER_APP_NAME = "celery_worker"
+POSTGRES_PERMISSIONS_APP_NAME = "permissions"
+POSTGRES_UNKNOWN_APP_NAME = "unknown"
 
 # API Keys
 DANSWER_API_KEY_PREFIX = "API_KEY__"
@@ -104,6 +113,7 @@ class DocumentSource(str, Enum):
     R2 = "r2"
     GOOGLE_CLOUD_STORAGE = "google_cloud_storage"
     OCI_STORAGE = "oci_storage"
+    NOT_APPLICABLE = "not_applicable"
 
 
 class BlobType(str, Enum):
@@ -111,6 +121,9 @@ class BlobType(str, Enum):
     S3 = "s3"
     GOOGLE_CLOUD_STORAGE = "google_cloud_storage"
     OCI_STORAGE = "oci_storage"
+
+    # Special case, for internet search
+    NOT_APPLICABLE = "not_applicable"
 
 
 class DocumentIndexType(str, Enum):

@@ -42,9 +42,26 @@ class QADocsResponse(RetrievalDocs):
         return initial_dict
 
 
-# Second chunk of info for streaming QA
 class LLMRelevanceFilterResponse(BaseModel):
     relevant_chunk_indices: list[int]
+
+
+class RelevanceAnalysis(BaseModel):
+    relevant: bool
+    content: str | None = None
+
+
+class SectionRelevancePiece(RelevanceAnalysis):
+    """LLM analysis mapped to an Inference Section"""
+
+    document_id: str
+    chunk_id: int  # ID of the center chunk for a given inference section
+
+
+class DocumentRelevance(BaseModel):
+    """Contains all relevance information for a given search"""
+
+    relevance_summaries: dict[str, RelevanceAnalysis]
 
 
 class DanswerAnswerPiece(BaseModel):

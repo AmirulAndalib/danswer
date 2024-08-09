@@ -10,14 +10,17 @@ from danswer.chat.chat_utils import llm_doc_from_inference_section
 from danswer.chat.models import DanswerContext
 from danswer.chat.models import DanswerContexts
 from danswer.chat.models import LlmDoc
+from danswer.chat.models import SectionRelevancePiece
 from danswer.db.models import Persona
 from danswer.db.models import User
 from danswer.dynamic_configs.interface import JSON_ro
-from danswer.llm.answering.doc_pruning import prune_documents
 from danswer.llm.answering.models import DocumentPruningConfig
 from danswer.llm.answering.models import PreviousMessage
 from danswer.llm.answering.models import PromptConfig
+from danswer.llm.answering.prune_and_merge import prune_and_merge_sections
+from danswer.llm.answering.prune_and_merge import prune_sections
 from danswer.llm.interfaces import LLM
+from danswer.search.enums import LLMEvaluationType
 from danswer.search.enums import QueryFlow
 from danswer.search.enums import SearchType
 from danswer.search.models import IndexFilters
@@ -30,11 +33,15 @@ from danswer.secondary_llm_flows.query_expansion import history_based_query_reph
 from danswer.tools.search.search_utils import llm_doc_to_dict
 from danswer.tools.tool import Tool
 from danswer.tools.tool import ToolResponse
+from danswer.utils.logger import setup_logger
+
+logger = setup_logger()
 
 SEARCH_RESPONSE_SUMMARY_ID = "search_response_summary"
 SEARCH_DOC_CONTENT_ID = "search_doc_content"
 SECTION_RELEVANCE_LIST_ID = "section_relevance_list"
 FINAL_CONTEXT_DOCUMENTS = "final_context_documents"
+SEARCH_EVALUATION_ID = "llm_doc_eval"
 
 
 class SearchResponseSummary(BaseModel):
@@ -46,7 +53,7 @@ class SearchResponseSummary(BaseModel):
     recency_bias_multiplier: float
 
 
-search_tool_description = """
+SEARCH_TOOL_DESCRIPTION = """
 Runs a semantic search over the user's knowledge base. The default behavior is to use this tool. \
 The only scenario where you should not use this tool is if:
 
@@ -59,7 +66,9 @@ HINT: if you are unfamiliar with the user input OR think the user input is a typ
 
 
 class SearchTool(Tool):
-    NAME = "run_search"
+    _NAME = "run_search"
+    _DISPLAY_NAME = "Search Tool"
+    _DESCRIPTION = SEARCH_TOOL_DESCRIPTION
 
     def __init__(
         self,
@@ -69,10 +78,12 @@ class SearchTool(Tool):
         retrieval_options: RetrievalDetails | None,
         prompt_config: PromptConfig,
         llm: LLM,
+        fast_llm: LLM,
         pruning_config: DocumentPruningConfig,
+        evaluation_type: LLMEvaluationType,
         # if specified, will not actually run a search and will instead return these
         # sections. Used when the user selects specific docs to talk to
-        selected_docs: list[LlmDoc] | None = None,
+        selected_sections: list[InferenceSection] | None = None,
         chunks_above: int = 0,
         chunks_below: int = 0,
         full_doc: bool = False,
@@ -83,9 +94,11 @@ class SearchTool(Tool):
         self.retrieval_options = retrieval_options
         self.prompt_config = prompt_config
         self.llm = llm
+        self.fast_llm = fast_llm
         self.pruning_config = pruning_config
+        self.evaluation_type = evaluation_type
 
-        self.selected_docs = selected_docs
+        self.selected_sections = selected_sections
 
         self.chunks_above = chunks_above
         self.chunks_below = chunks_below
@@ -93,8 +106,17 @@ class SearchTool(Tool):
         self.bypass_acl = bypass_acl
         self.db_session = db_session
 
+    @property
     def name(self) -> str:
-        return self.NAME
+        return self._NAME
+
+    @property
+    def description(self) -> str:
+        return self._DESCRIPTION
+
+    @property
+    def display_name(self) -> str:
+        return self._DISPLAY_NAME
 
     """For explicit tool calling"""
 
@@ -102,8 +124,8 @@ class SearchTool(Tool):
         return {
             "type": "function",
             "function": {
-                "name": self.name(),
-                "description": search_tool_description,
+                "name": self.name,
+                "description": self.description,
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -158,8 +180,8 @@ class SearchTool(Tool):
     def _build_response_for_specified_sections(
         self, query: str
     ) -> Generator[ToolResponse, None, None]:
-        if self.selected_docs is None:
-            raise ValueError("sections must be specified")
+        if self.selected_sections is None:
+            raise ValueError("Sections must be specified")
 
         yield ToolResponse(
             id=SEARCH_RESPONSE_SUMMARY_ID,
@@ -172,95 +194,121 @@ class SearchTool(Tool):
                 recency_bias_multiplier=1.0,
             ),
         )
+
+        # Build selected sections for specified documents
+        selected_sections = [
+            SectionRelevancePiece(
+                relevant=True,
+                document_id=section.center_chunk.document_id,
+                chunk_id=section.center_chunk.chunk_id,
+            )
+            for section in self.selected_sections
+        ]
+
         yield ToolResponse(
             id=SECTION_RELEVANCE_LIST_ID,
-            response=[i for i in range(len(self.selected_docs))],
+            response=selected_sections,
         )
-        yield ToolResponse(
-            id=FINAL_CONTEXT_DOCUMENTS,
-            response=prune_documents(
-                docs=self.selected_docs,
-                doc_relevance_list=None,
-                prompt_config=self.prompt_config,
-                llm_config=self.llm.config,
-                question=query,
-                document_pruning_config=self.pruning_config,
-            ),
+
+        final_context_sections = prune_and_merge_sections(
+            sections=self.selected_sections,
+            section_relevance_list=None,
+            prompt_config=self.prompt_config,
+            llm_config=self.llm.config,
+            question=query,
+            document_pruning_config=self.pruning_config,
         )
+
+        llm_docs = [
+            llm_doc_from_inference_section(section)
+            for section in final_context_sections
+        ]
+
+        yield ToolResponse(id=FINAL_CONTEXT_DOCUMENTS, response=llm_docs)
 
     def run(self, **kwargs: str) -> Generator[ToolResponse, None, None]:
         query = cast(str, kwargs["query"])
 
-        if self.selected_docs:
+        if self.selected_sections:
             yield from self._build_response_for_specified_sections(query)
             return
 
         search_pipeline = SearchPipeline(
             search_request=SearchRequest(
                 query=query,
+                evaluation_type=self.evaluation_type,
                 human_selected_filters=(
                     self.retrieval_options.filters if self.retrieval_options else None
                 ),
                 persona=self.persona,
-                offset=self.retrieval_options.offset
-                if self.retrieval_options
-                else None,
+                offset=(
+                    self.retrieval_options.offset if self.retrieval_options else None
+                ),
                 limit=self.retrieval_options.limit if self.retrieval_options else None,
                 chunks_above=self.chunks_above,
                 chunks_below=self.chunks_below,
                 full_doc=self.full_doc,
+                enable_auto_detect_filters=(
+                    self.retrieval_options.enable_auto_detect_filters
+                    if self.retrieval_options
+                    else None
+                ),
             ),
             user=self.user,
             llm=self.llm,
+            fast_llm=self.fast_llm,
             bypass_acl=self.bypass_acl,
             db_session=self.db_session,
+            prompt_config=self.prompt_config,
+            pruning_config=self.pruning_config,
         )
+
         yield ToolResponse(
             id=SEARCH_RESPONSE_SUMMARY_ID,
             response=SearchResponseSummary(
                 rephrased_query=query,
-                top_sections=search_pipeline.reranked_sections,
+                top_sections=search_pipeline.final_context_sections,
                 predicted_flow=search_pipeline.predicted_flow,
                 predicted_search=search_pipeline.predicted_search_type,
                 final_filters=search_pipeline.search_query.filters,
                 recency_bias_multiplier=search_pipeline.search_query.recency_bias_multiplier,
             ),
         )
+
         yield ToolResponse(
             id=SEARCH_DOC_CONTENT_ID,
             response=DanswerContexts(
                 contexts=[
                     DanswerContext(
-                        content=section.content,
-                        document_id=section.document_id,
-                        semantic_identifier=section.semantic_identifier,
-                        blurb=section.blurb,
+                        content=section.combined_content,
+                        document_id=section.center_chunk.document_id,
+                        semantic_identifier=section.center_chunk.semantic_identifier,
+                        blurb=section.center_chunk.blurb,
                     )
                     for section in search_pipeline.reranked_sections
                 ]
             ),
         )
+
         yield ToolResponse(
             id=SECTION_RELEVANCE_LIST_ID,
-            response=search_pipeline.relevant_chunk_indices,
+            response=search_pipeline.section_relevance,
         )
 
-        llm_docs = [
-            llm_doc_from_inference_section(section)
-            for section in search_pipeline.reranked_sections
-        ]
-        final_context_documents = prune_documents(
-            docs=llm_docs,
-            doc_relevance_list=[
-                True if ind in search_pipeline.relevant_chunk_indices else False
-                for ind in range(len(llm_docs))
-            ],
+        pruned_sections = prune_sections(
+            sections=search_pipeline.final_context_sections,
+            section_relevance_list=search_pipeline.section_relevance_list,
             prompt_config=self.prompt_config,
             llm_config=self.llm.config,
             question=query,
             document_pruning_config=self.pruning_config,
         )
-        yield ToolResponse(id=FINAL_CONTEXT_DOCUMENTS, response=final_context_documents)
+
+        llm_docs = [
+            llm_doc_from_inference_section(section) for section in pruned_sections
+        ]
+
+        yield ToolResponse(id=FINAL_CONTEXT_DOCUMENTS, response=llm_docs)
 
     def final_result(self, *args: ToolResponse) -> JSON_ro:
         final_docs = cast(

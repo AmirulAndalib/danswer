@@ -1,0 +1,322 @@
+import re
+import time
+
+import requests
+from httpx import HTTPError
+from retry import retry
+
+from danswer.configs.model_configs import BATCH_SIZE_ENCODE_CHUNKS
+from danswer.configs.model_configs import (
+    BATCH_SIZE_ENCODE_CHUNKS_FOR_API_EMBEDDING_SERVICES,
+)
+from danswer.configs.model_configs import DOC_EMBEDDING_CONTEXT_SIZE
+from danswer.db.models import EmbeddingModel as DBEmbeddingModel
+from danswer.natural_language_processing.utils import get_tokenizer
+from danswer.natural_language_processing.utils import tokenizer_trim_content
+from danswer.utils.logger import setup_logger
+from shared_configs.configs import MODEL_SERVER_HOST
+from shared_configs.configs import MODEL_SERVER_PORT
+from shared_configs.enums import EmbedTextType
+from shared_configs.model_server_models import Embedding
+from shared_configs.model_server_models import EmbedRequest
+from shared_configs.model_server_models import EmbedResponse
+from shared_configs.model_server_models import IntentRequest
+from shared_configs.model_server_models import IntentResponse
+from shared_configs.model_server_models import RerankRequest
+from shared_configs.model_server_models import RerankResponse
+from shared_configs.utils import batch_list
+
+logger = setup_logger()
+
+
+def clean_model_name(model_str: str) -> str:
+    return model_str.replace("/", "_").replace("-", "_").replace(".", "_")
+
+
+_WHITELIST = set(
+    " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\n\t"
+)
+_INITIAL_FILTER = re.compile(
+    "["
+    "\U00000080-\U0000FFFF"  # All Unicode characters beyond ASCII
+    "\U00010000-\U0010FFFF"  # All Unicode characters in supplementary planes
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def clean_openai_text(text: str) -> str:
+    # First, remove all weird characters
+    cleaned = _INITIAL_FILTER.sub("", text)
+    # Then, keep only whitelisted characters
+    return "".join(char for char in cleaned if char in _WHITELIST)
+
+
+def build_model_server_url(
+    model_server_host: str,
+    model_server_port: int,
+) -> str:
+    model_server_url = f"{model_server_host}:{model_server_port}"
+
+    # use protocol if provided
+    if "http" in model_server_url:
+        return model_server_url
+
+    # otherwise default to http
+    return f"http://{model_server_url}"
+
+
+class EmbeddingModel:
+    def __init__(
+        self,
+        server_host: str,  # Changes depending on indexing or inference
+        server_port: int,
+        model_name: str | None,
+        normalize: bool,
+        query_prefix: str | None,
+        passage_prefix: str | None,
+        api_key: str | None,
+        provider_type: str | None,
+        # The following are globals are currently not configurable
+        max_seq_length: int = DOC_EMBEDDING_CONTEXT_SIZE,
+        retrim_content: bool = False,
+    ) -> None:
+        self.api_key = api_key
+        self.provider_type = provider_type
+        self.max_seq_length = max_seq_length
+        self.query_prefix = query_prefix
+        self.passage_prefix = passage_prefix
+        self.normalize = normalize
+        self.model_name = model_name
+        self.retrim_content = retrim_content
+
+        model_server_url = build_model_server_url(server_host, server_port)
+        self.embed_server_endpoint = f"{model_server_url}/encoder/bi-encoder-embed"
+
+    def _make_model_server_request(self, embed_request: EmbedRequest) -> EmbedResponse:
+        def _make_request() -> EmbedResponse:
+            response = requests.post(
+                self.embed_server_endpoint, json=embed_request.dict()
+            )
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as e:
+                try:
+                    error_detail = response.json().get("detail", str(e))
+                except Exception:
+                    error_detail = response.text
+                raise HTTPError(f"HTTP error occurred: {error_detail}") from e
+            except requests.RequestException as e:
+                raise HTTPError(f"Request failed: {str(e)}") from e
+
+            return EmbedResponse(**response.json())
+
+        # only perform retries for the non-realtime embedding of passages (e.g. for indexing)
+        if embed_request.text_type == EmbedTextType.PASSAGE:
+            return retry(tries=3, delay=5)(_make_request)()
+        else:
+            return _make_request()
+
+    def _encode_api_model(
+        self, texts: list[str], text_type: EmbedTextType, batch_size: int
+    ) -> list[Embedding]:
+        if not self.provider_type:
+            raise ValueError("Provider type is not set for API embedding")
+
+        embeddings: list[Embedding] = []
+
+        text_batches = batch_list(texts, batch_size)
+        for idx, text_batch in enumerate(text_batches, start=1):
+            logger.debug(f"Encoding batch {idx} of {len(text_batches)}")
+            embed_request = EmbedRequest(
+                model_name=self.model_name,
+                texts=text_batch,
+                max_context_length=self.max_seq_length,
+                normalize_embeddings=self.normalize,
+                api_key=self.api_key,
+                provider_type=self.provider_type,
+                text_type=text_type,
+                manual_query_prefix=self.query_prefix,
+                manual_passage_prefix=self.passage_prefix,
+            )
+            response = self._make_model_server_request(embed_request)
+            embeddings.extend(response.embeddings)
+
+        return embeddings
+
+    def _encode_local_model(
+        self,
+        texts: list[str],
+        text_type: EmbedTextType,
+        batch_size: int,
+    ) -> list[Embedding]:
+        text_batches = batch_list(texts, batch_size)
+        embeddings: list[Embedding] = []
+        logger.debug(
+            f"Encoding {len(texts)} texts in {len(text_batches)} batches for local model"
+        )
+        for idx, text_batch in enumerate(text_batches, start=1):
+            logger.debug(f"Encoding batch {idx} of {len(text_batches)}")
+            embed_request = EmbedRequest(
+                model_name=self.model_name,
+                texts=text_batch,
+                max_context_length=self.max_seq_length,
+                normalize_embeddings=self.normalize,
+                api_key=self.api_key,
+                provider_type=self.provider_type,
+                text_type=text_type,
+                manual_query_prefix=self.query_prefix,
+                manual_passage_prefix=self.passage_prefix,
+            )
+
+            response = self._make_model_server_request(embed_request)
+            embeddings.extend(response.embeddings)
+        return embeddings
+
+    def encode(
+        self,
+        texts: list[str],
+        text_type: EmbedTextType,
+        local_embedding_batch_size: int = BATCH_SIZE_ENCODE_CHUNKS,
+        api_embedding_batch_size: int = BATCH_SIZE_ENCODE_CHUNKS_FOR_API_EMBEDDING_SERVICES,
+    ) -> list[Embedding]:
+        if not texts or not all(texts):
+            raise ValueError(f"Empty or missing text for embedding: {texts}")
+
+        if self.retrim_content:
+            # This is applied during indexing as a catchall for overly long titles (or other uncapped fields)
+            # Note that this uses just the default tokenizer which may also lead to very minor miscountings
+            # However this slight miscounting is very unlikely to have any material impact.
+            texts = [
+                tokenizer_trim_content(
+                    content=text,
+                    desired_length=self.max_seq_length,
+                    tokenizer=get_tokenizer(
+                        model_name=self.model_name,
+                        provider_type=self.provider_type,
+                    ),
+                )
+                for text in texts
+            ]
+
+        if self.provider_type:
+            if self.provider_type == "openai":
+                texts = [clean_openai_text(text) for text in texts]
+            return self._encode_api_model(
+                texts=texts, text_type=text_type, batch_size=api_embedding_batch_size
+            )
+
+        # if no provider, use local model
+        return self._encode_local_model(
+            texts=texts, text_type=text_type, batch_size=local_embedding_batch_size
+        )
+
+
+class RerankingModel:
+    def __init__(
+        self,
+        model_name: str,
+        api_key: str | None,
+        model_server_host: str = MODEL_SERVER_HOST,
+        model_server_port: int = MODEL_SERVER_PORT,
+    ) -> None:
+        model_server_url = build_model_server_url(model_server_host, model_server_port)
+        self.rerank_server_endpoint = model_server_url + "/encoder/cross-encoder-scores"
+        self.model_name = model_name
+        self.api_key = api_key
+
+    def predict(self, query: str, passages: list[str]) -> list[float]:
+        rerank_request = RerankRequest(
+            query=query,
+            documents=passages,
+            model_name=self.model_name,
+            api_key=self.api_key,
+        )
+
+        response = requests.post(
+            self.rerank_server_endpoint, json=rerank_request.dict()
+        )
+        response.raise_for_status()
+
+        return RerankResponse(**response.json()).scores
+
+
+class QueryAnalysisModel:
+    def __init__(
+        self,
+        model_server_host: str = MODEL_SERVER_HOST,
+        model_server_port: int = MODEL_SERVER_PORT,
+        # Lean heavily towards not throwing out keywords
+        keyword_percent_threshold: float = 0.1,
+        # Lean towards semantic which is the default
+        semantic_percent_threshold: float = 0.4,
+    ) -> None:
+        model_server_url = build_model_server_url(model_server_host, model_server_port)
+        self.intent_server_endpoint = model_server_url + "/custom/query-analysis"
+        self.keyword_percent_threshold = keyword_percent_threshold
+        self.semantic_percent_threshold = semantic_percent_threshold
+
+    def predict(
+        self,
+        query: str,
+    ) -> tuple[bool, list[str]]:
+        intent_request = IntentRequest(
+            query=query,
+            keyword_percent_threshold=self.keyword_percent_threshold,
+            semantic_percent_threshold=self.semantic_percent_threshold,
+        )
+
+        response = requests.post(
+            self.intent_server_endpoint, json=intent_request.dict()
+        )
+        response.raise_for_status()
+
+        response_model = IntentResponse(**response.json())
+
+        return response_model.is_keyword, response_model.keywords
+
+
+def warm_up_encoders(
+    embedding_model: DBEmbeddingModel,
+    model_server_host: str = MODEL_SERVER_HOST,
+    model_server_port: int = MODEL_SERVER_PORT,
+) -> None:
+    model_name = embedding_model.model_name
+    normalize = embedding_model.normalize
+    provider_type = embedding_model.provider_type
+    warm_up_str = (
+        "Danswer is amazing! Check out our easy deployment guide at "
+        "https://docs.danswer.dev/quickstart"
+    )
+
+    # May not be the exact same tokenizer used for the indexing flow
+    logger.debug(f"Warming up encoder model: {model_name}")
+    get_tokenizer(model_name=model_name, provider_type=provider_type).encode(
+        warm_up_str
+    )
+
+    embed_model = EmbeddingModel(
+        model_name=model_name,
+        normalize=normalize,
+        provider_type=provider_type,
+        # Not a big deal if prefix is incorrect
+        query_prefix=None,
+        passage_prefix=None,
+        server_host=model_server_host,
+        server_port=model_server_port,
+        api_key=None,
+    )
+
+    # First time downloading the models it may take even longer, but just in case,
+    # retry the whole server
+    wait_time = 5
+    for _ in range(20):
+        try:
+            embed_model.encode(texts=[warm_up_str], text_type=EmbedTextType.QUERY)
+            return
+        except Exception:
+            logger.exception(
+                f"Failed to run test embedding, retrying in {wait_time} seconds..."
+            )
+            time.sleep(wait_time)
+    raise Exception("Failed to run test embedding.")

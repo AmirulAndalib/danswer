@@ -20,7 +20,7 @@ from danswer.db.connector_credential_pair import update_connector_credential_pai
 from danswer.db.engine import get_sqlalchemy_engine
 from danswer.db.index_attempt import get_index_attempt
 from danswer.db.index_attempt import mark_attempt_failed
-from danswer.db.index_attempt import mark_attempt_in_progress__no_commit
+from danswer.db.index_attempt import mark_attempt_in_progress
 from danswer.db.index_attempt import mark_attempt_succeeded
 from danswer.db.index_attempt import update_docs_indexed
 from danswer.db.models import IndexAttempt
@@ -49,19 +49,19 @@ def _get_document_generator(
     are the complete list of existing documents of the connector. If the task
     of type LOAD_STATE, the list will be considered complete and otherwise incomplete.
     """
-    task = attempt.connector.input_type
+    task = attempt.connector_credential_pair.connector.input_type
 
     try:
         runnable_connector = instantiate_connector(
-            attempt.connector.source,
+            attempt.connector_credential_pair.connector.source,
             task,
-            attempt.connector.connector_specific_config,
-            attempt.credential,
+            attempt.connector_credential_pair.connector.connector_specific_config,
+            attempt.connector_credential_pair.credential,
             db_session,
         )
     except Exception as e:
         logger.exception(f"Unable to instantiate connector due to {e}")
-        disable_connector(attempt.connector.id, db_session)
+        disable_connector(attempt.connector_credential_pair.connector.id, db_session)
         raise e
 
     if task == InputType.LOAD_STATE:
@@ -70,7 +70,10 @@ def _get_document_generator(
 
     elif task == InputType.POLL:
         assert isinstance(runnable_connector, PollConnector)
-        if attempt.connector_id is None or attempt.credential_id is None:
+        if (
+            attempt.connector_credential_pair.connector_id is None
+            or attempt.connector_credential_pair.connector_id is None
+        ):
             raise ValueError(
                 f"Polling attempt {attempt.id} is missing connector_id or credential_id, "
                 f"can't fetch time range."
@@ -98,7 +101,6 @@ def _run_indexing(
     3. Updates Postgres to record the indexed documents + the outcome of this run
     """
     start_time = time.time()
-
     db_embedding_model = index_attempt.embedding_model
     index_name = db_embedding_model.index_name
 
@@ -116,6 +118,8 @@ def _run_indexing(
         normalize=db_embedding_model.normalize,
         query_prefix=db_embedding_model.query_prefix,
         passage_prefix=db_embedding_model.passage_prefix,
+        api_key=db_embedding_model.api_key,
+        provider_type=db_embedding_model.provider_type,
     )
 
     indexing_pipeline = build_indexing_pipeline(
@@ -126,16 +130,21 @@ def _run_indexing(
         db_session=db_session,
     )
 
-    db_connector = index_attempt.connector
-    db_credential = index_attempt.credential
+    db_connector = index_attempt.connector_credential_pair.connector
+    db_credential = index_attempt.connector_credential_pair.credential
+
     last_successful_index_time = (
-        0.0
-        if index_attempt.from_beginning
-        else get_last_successful_attempt_time(
-            connector_id=db_connector.id,
-            credential_id=db_credential.id,
-            embedding_model=index_attempt.embedding_model,
-            db_session=db_session,
+        db_connector.indexing_start.timestamp()
+        if index_attempt.from_beginning and db_connector.indexing_start is not None
+        else (
+            0.0
+            if index_attempt.from_beginning
+            else get_last_successful_attempt_time(
+                connector_id=db_connector.id,
+                credential_id=db_credential.id,
+                embedding_model=index_attempt.embedding_model,
+                db_session=db_session,
+            )
         )
     )
 
@@ -188,7 +197,7 @@ def _run_indexing(
                 )
 
                 new_docs, total_batch_chunks = indexing_pipeline(
-                    documents=doc_batch,
+                    document_batch=doc_batch,
                     index_attempt_metadata=IndexAttemptMetadata(
                         connector_id=db_connector.id,
                         credential_id=db_credential.id,
@@ -249,8 +258,8 @@ def _run_indexing(
                 if is_primary:
                     update_connector_credential_pair(
                         db_session=db_session,
-                        connector_id=index_attempt.connector.id,
-                        credential_id=index_attempt.credential.id,
+                        connector_id=index_attempt.connector_credential_pair.connector.id,
+                        credential_id=index_attempt.connector_credential_pair.credential.id,
                         net_docs=net_doc_change,
                     )
                 raise e
@@ -268,11 +277,9 @@ def _run_indexing(
             run_dt=run_end_dt,
         )
 
+    elapsed_time = time.time() - start_time
     logger.info(
-        f"Indexed or refreshed {document_count} total documents for a total of {chunk_count} indexed chunks"
-    )
-    logger.info(
-        f"Connector successfully finished, elapsed time: {time.time() - start_time} seconds"
+        f"Connector succeeded: docs={document_count} chunks={chunk_count} elapsed={elapsed_time:.2f}s"
     )
 
 
@@ -287,6 +294,7 @@ def _prepare_index_attempt(db_session: Session, index_attempt_id: int) -> IndexA
         db_session=db_session,
         index_attempt_id=index_attempt_id,
     )
+
     if attempt is None:
         raise RuntimeError(f"Unable to find IndexAttempt for ID '{index_attempt_id}'")
 
@@ -297,9 +305,7 @@ def _prepare_index_attempt(db_session: Session, index_attempt_id: int) -> IndexA
         )
 
     # only commit once, to make sure this all happens in a single transaction
-    mark_attempt_in_progress__no_commit(attempt)
-    if attempt.embedding_model.status != IndexModelStatus.PRESENT:
-        db_session.commit()
+    mark_attempt_in_progress(attempt, db_session)
 
     return attempt
 
@@ -322,17 +328,19 @@ def run_indexing_entrypoint(index_attempt_id: int, is_ee: bool = False) -> None:
             attempt = _prepare_index_attempt(db_session, index_attempt_id)
 
             logger.info(
-                f"Running indexing attempt for connector: '{attempt.connector.name}', "
-                f"with config: '{attempt.connector.connector_specific_config}', and "
-                f"with credentials: '{attempt.credential_id}'"
+                f"Indexing starting: "
+                f"connector='{attempt.connector_credential_pair.connector.name}' "
+                f"config='{attempt.connector_credential_pair.connector.connector_specific_config}' "
+                f"credentials='{attempt.connector_credential_pair.connector_id}'"
             )
 
             _run_indexing(db_session, attempt)
 
             logger.info(
-                f"Completed indexing attempt for connector: '{attempt.connector.name}', "
-                f"with config: '{attempt.connector.connector_specific_config}', and "
-                f"with credentials: '{attempt.credential_id}'"
+                f"Indexing finished: "
+                f"connector='{attempt.connector_credential_pair.connector.name}' "
+                f"config='{attempt.connector_credential_pair.connector.connector_specific_config}' "
+                f"credentials='{attempt.connector_credential_pair.connector_id}'"
             )
     except Exception as e:
         logger.exception(f"Indexing job with ID '{index_attempt_id}' failed due to {e}")

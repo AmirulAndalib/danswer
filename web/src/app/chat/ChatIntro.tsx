@@ -7,7 +7,6 @@ import { FiBookmark, FiCpu, FiInfo, FiX, FiZoomIn } from "react-icons/fi";
 import { HoverPopup } from "@/components/HoverPopup";
 import { Modal } from "@/components/Modal";
 import { useState } from "react";
-import { FaCaretDown, FaCaretRight } from "react-icons/fa";
 import { Logo } from "@/components/Logo";
 
 const MAX_PERSONAS_TO_DISPLAY = 4;
@@ -29,26 +28,20 @@ function HelperItemDisplay({
 
 export function ChatIntro({
   availableSources,
-  availablePersonas,
   selectedPersona,
 }: {
   availableSources: ValidSources[];
-  availablePersonas: Persona[];
   selectedPersona: Persona;
 }) {
   const availableSourceMetadata = getSourceMetadataForSources(availableSources);
 
-  const [displaySources, setDisplaySources] = useState(false);
-
   return (
     <>
       <div className="flex justify-center items-center h-full">
-        <div className="w-message-xs 2xl:w-message-sm 3xl:w-message">
+        <div className="mobile:w-[90%] mobile:px-4 w-message-xs 2xl:w-message-sm 3xl:w-message">
           <div className="flex">
             <div className="mx-auto">
-              <Logo height={80} width={80} className="m-auto" />
-
-              <div className="m-auto text-3xl font-bold text-strong mt-4 w-fit">
+              <div className="m-auto text-3xl font-strong font-bold text-strong w-fit">
                 {selectedPersona?.name || "How can I help you today?"}
               </div>
               {selectedPersona && (

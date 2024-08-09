@@ -1,6 +1,6 @@
+import json
 from collections.abc import Callable
 from collections.abc import Iterator
-from copy import copy
 from typing import Any
 from typing import cast
 from typing import TYPE_CHECKING
@@ -16,10 +16,8 @@ from langchain.schema.messages import AIMessage
 from langchain.schema.messages import BaseMessage
 from langchain.schema.messages import HumanMessage
 from langchain.schema.messages import SystemMessage
-from tiktoken.core import Encoding
 
 from danswer.configs.constants import MessageType
-from danswer.configs.model_configs import DOC_EMBEDDING_CONTEXT_SIZE
 from danswer.configs.model_configs import GEN_AI_MAX_OUTPUT_TOKENS
 from danswer.configs.model_configs import GEN_AI_MAX_TOKENS
 from danswer.configs.model_configs import GEN_AI_MODEL_PROVIDER
@@ -28,69 +26,26 @@ from danswer.file_store.models import ChatFileType
 from danswer.file_store.models import InMemoryChatFile
 from danswer.llm.interfaces import LLM
 from danswer.prompts.constants import CODE_BLOCK_PAT
-from danswer.search.models import InferenceChunk
 from danswer.utils.logger import setup_logger
 from shared_configs.configs import LOG_LEVEL
+
 
 if TYPE_CHECKING:
     from danswer.llm.answering.models import PreviousMessage
 
 logger = setup_logger()
 
-_LLM_TOKENIZER: Any = None
-_LLM_TOKENIZER_ENCODE: Callable[[str], Any] | None = None
-
-
-def get_default_llm_tokenizer() -> Encoding:
-    """Currently only supports the OpenAI default tokenizer: tiktoken"""
-    global _LLM_TOKENIZER
-    if _LLM_TOKENIZER is None:
-        _LLM_TOKENIZER = tiktoken.get_encoding("cl100k_base")
-    return _LLM_TOKENIZER
-
-
-def get_default_llm_token_encode() -> Callable[[str], Any]:
-    global _LLM_TOKENIZER_ENCODE
-    if _LLM_TOKENIZER_ENCODE is None:
-        tokenizer = get_default_llm_tokenizer()
-        if isinstance(tokenizer, Encoding):
-            return tokenizer.encode  # type: ignore
-
-        # Currently only supports OpenAI encoder
-        raise ValueError("Invalid Encoder selected")
-
-    return _LLM_TOKENIZER_ENCODE
-
-
-def tokenizer_trim_content(
-    content: str, desired_length: int, tokenizer: Encoding
-) -> str:
-    tokens = tokenizer.encode(content)
-    if len(tokens) > desired_length:
-        content = tokenizer.decode(tokens[:desired_length])
-    return content
-
-
-def tokenizer_trim_chunks(
-    chunks: list[InferenceChunk], max_chunk_toks: int = DOC_EMBEDDING_CONTEXT_SIZE
-) -> list[InferenceChunk]:
-    tokenizer = get_default_llm_tokenizer()
-    new_chunks = copy(chunks)
-    for ind, chunk in enumerate(new_chunks):
-        new_content = tokenizer_trim_content(chunk.content, max_chunk_toks, tokenizer)
-        if len(new_content) != len(chunk.content):
-            new_chunk = copy(chunk)
-            new_chunk.content = new_content
-            new_chunks[ind] = new_chunk
-    return new_chunks
-
 
 def translate_danswer_msg_to_langchain(
     msg: Union[ChatMessage, "PreviousMessage"],
 ) -> BaseMessage:
+    files: list[InMemoryChatFile] = []
+
     # If the message is a `ChatMessage`, it doesn't have the downloaded files
-    # attached. Just ignore them for now
-    files = [] if isinstance(msg, ChatMessage) else msg.files
+    # attached. Just ignore them for now. Also, OpenAI doesn't allow files to
+    # be attached to AI messages, so we must remove them
+    if not isinstance(msg, ChatMessage) and msg.message_type != MessageType.ASSISTANT:
+        files = msg.files
     content = build_content_with_imgs(msg.message, files)
 
     if msg.message_type == MessageType.SYSTEM:
@@ -270,6 +225,13 @@ def check_message_tokens(
             total_tokens += check_number_of_tokens(part["text"], encode_fn)
         elif part["type"] == "image_url":
             total_tokens += _IMG_TOKENS
+
+    if isinstance(message, AIMessage) and message.tool_calls:
+        for tool_call in message.tool_calls:
+            total_tokens += check_number_of_tokens(
+                json.dumps(tool_call["args"]), encode_fn
+            )
+            total_tokens += check_number_of_tokens(tool_call["name"], encode_fn)
 
     return total_tokens
 

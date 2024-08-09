@@ -1,24 +1,23 @@
 "use client";
 
 import { useState, useRef, useContext } from "react";
-import { FiSearch, FiMessageSquare, FiTool, FiLogOut } from "react-icons/fi";
+import { FiLogOut } from "react-icons/fi";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { User } from "@/lib/types";
 import { checkUserIsNoAuthUser, logout } from "@/lib/user";
-import { BasicSelectable } from "@/components/BasicClickable";
 import { Popover } from "./popover/Popover";
-import { FaBrain } from "react-icons/fa";
 import { LOGOUT_DISABLED } from "@/lib/constants";
-import { Settings } from "@/app/admin/settings/interfaces";
 import { SettingsContext } from "./settings/SettingsProvider";
+import { LightSettingsIcon } from "./icons/icons";
+import { pageType } from "@/app/chat/sessionSidebar/types";
 
 export function UserDropdown({
   user,
-  hideChatAndSearch,
+  page,
 }: {
   user: User | null;
-  hideChatAndSearch?: boolean;
+  page?: pageType;
 }) {
   const [userInfoVisible, setUserInfoVisible] = useState(false);
   const userInfoRef = useRef<HTMLDivElement>(null);
@@ -44,25 +43,40 @@ export function UserDropdown({
     user && !checkUserIsNoAuthUser(user.id) && !LOGOUT_DISABLED;
 
   return (
-    <div className="relative" ref={userInfoRef}>
+    <div className="group relative" ref={userInfoRef}>
       <Popover
         open={userInfoVisible}
         onOpenChange={setUserInfoVisible}
         content={
-          <BasicSelectable padding={false} selected={false}>
+          <div
+            onClick={() => setUserInfoVisible(!userInfoVisible)}
+            className="flex cursor-pointer"
+          >
             <div
-              onClick={() => setUserInfoVisible(!userInfoVisible)}
-              className="flex cursor-pointer"
+              className="
+                my-auto
+                bg-background-strong
+                ring-2
+                ring-transparent
+                group-hover:ring-background-300/50
+                transition-ring
+                duration-150
+                rounded-lg
+                inline-block
+                flex-none
+                px-2
+                text-base
+              "
             >
-              <div className="my-auto bg-user hover:bg-user-hover rounded-lg px-2 text-base font-normal">
-                {user && user.email ? user.email[0].toUpperCase() : "A"}
-              </div>
+              {user && user.email ? user.email[0].toUpperCase() : "A"}
             </div>
-          </BasicSelectable>
+          </div>
         }
         popover={
           <div
             className={`
+                p-2
+                min-w-[200px]
                 text-strong 
                 text-sm
                 border 
@@ -79,54 +93,21 @@ export function UserDropdown({
                 overscroll-contain
               `}
           >
-            {!hideChatAndSearch && (
-              <>
-                {settings.search_page_enabled && (
-                  <Link
-                    href="/search"
-                    className="flex py-3 px-4 rounded cursor-pointer hover:bg-hover-light"
-                  >
-                    <FiSearch className="my-auto mr-2 text-lg" />
-                    Danswer Search
-                  </Link>
-                )}
-                {settings.chat_page_enabled && (
-                  <>
-                    <Link
-                      href="/chat"
-                      className="flex py-3 px-4 rounded cursor-pointer hover:bg-hover-light"
-                    >
-                      <FiMessageSquare className="my-auto mr-2 text-lg" />
-                      Danswer Chat
-                    </Link>
-                    <Link
-                      href="/assistants/mine"
-                      className="flex py-3 px-4 rounded cursor-pointer hover:bg-hover-light"
-                    >
-                      <FaBrain className="my-auto mr-2 text-lg" />
-                      My Assistants
-                    </Link>
-                  </>
-                )}
-              </>
-            )}
             {showAdminPanel && (
               <>
-                {!hideChatAndSearch && (
-                  <div className="border-t border-border my-1" />
-                )}
                 <Link
                   href="/admin/indexing/status"
-                  className="flex py-3 px-4 cursor-pointer rounded hover:bg-hover-light"
+                  className="flex py-3 px-4 cursor-pointer !
+                   rounded hover:bg-hover-light"
                 >
-                  <FiTool className="my-auto mr-2 text-lg" />
+                  <LightSettingsIcon className="h-5 w-5 my-auto mr-2" />
                   Admin Panel
                 </Link>
               </>
             )}
             {showLogout && (
               <>
-                {(!hideChatAndSearch || showAdminPanel) && (
+                {(!(page == "search" || page == "chat") || showAdminPanel) && (
                   <div className="border-t border-border my-1" />
                 )}
                 <div

@@ -15,6 +15,7 @@ from playwright.sync_api import BrowserContext
 from playwright.sync_api import Playwright
 from playwright.sync_api import sync_playwright
 from requests_oauthlib import OAuth2Session  # type:ignore
+from urllib3.exceptions import MaxRetryError
 
 from danswer.configs.app_configs import INDEX_BATCH_SIZE
 from danswer.configs.app_configs import WEB_CONNECTOR_OAUTH_CLIENT_ID
@@ -29,6 +30,7 @@ from danswer.connectors.models import Section
 from danswer.file_processing.extract_file_text import pdf_to_text
 from danswer.file_processing.html_utils import web_html_cleanup
 from danswer.utils.logger import setup_logger
+from danswer.utils.sitemap import list_pages_for_site
 
 logger = setup_logger()
 
@@ -82,6 +84,13 @@ def check_internet_connection(url: str) -> None:
     try:
         response = requests.get(url, timeout=3)
         response.raise_for_status()
+    except requests.exceptions.SSLError as e:
+        cause = (
+            e.args[0].reason
+            if isinstance(e.args, tuple) and isinstance(e.args[0], MaxRetryError)
+            else e.args
+        )
+        raise Exception(f"SSL error {str(cause)}")
     except (requests.RequestException, ValueError):
         raise Exception(f"Unable to reach {url} - check your internet connection")
 
@@ -145,16 +154,21 @@ def extract_urls_from_sitemap(sitemap_url: str) -> list[str]:
     response.raise_for_status()
 
     soup = BeautifulSoup(response.content, "html.parser")
-    result = [
+    urls = [
         _ensure_absolute_url(sitemap_url, loc_tag.text)
         for loc_tag in soup.find_all("loc")
     ]
-    if not result:
+
+    if len(urls) == 0 and len(soup.find_all("urlset")) == 0:
+        # the given url doesn't look like a sitemap, let's try to find one
+        urls = list_pages_for_site(sitemap_url)
+
+    if len(urls) == 0:
         raise ValueError(
             f"No URLs found in sitemap {sitemap_url}. Try using the 'single' or 'recursive' scraping options instead."
         )
 
-    return result
+    return urls
 
 
 def _ensure_absolute_url(source_url: str, maybe_relative_url: str) -> str:
@@ -264,7 +278,7 @@ class WebConnector(LoadConnector):
                             id=current_url,
                             sections=[Section(link=current_url, text=page_text)],
                             source=DocumentSource.WEB,
-                            semantic_identifier=current_url.split(".")[-1],
+                            semantic_identifier=current_url.split("/")[-1],
                             metadata={},
                         )
                     )

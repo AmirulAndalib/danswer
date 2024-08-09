@@ -95,6 +95,7 @@ export async function* sendMessage({
   temperature,
   systemPromptOverride,
   useExistingUserMessage,
+  alternateAssistantId,
 }: {
   message: string;
   fileDescriptors: FileDescriptor[];
@@ -114,15 +115,18 @@ export async function* sendMessage({
   // if specified, will use the existing latest user message
   // and will ignore the specified `message`
   useExistingUserMessage?: boolean;
+  alternateAssistantId?: number;
 }) {
   const documentsAreSelected =
     selectedDocumentIds && selectedDocumentIds.length > 0;
+
   const sendMessageResponse = await fetch("/api/chat/send-message", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
+      alternate_assistant_id: alternateAssistantId,
       chat_session_id: chatSessionId,
       parent_message_id: parentMessageId,
       message: message,
@@ -381,6 +385,9 @@ export function processRawChatHistory(
       message: messageInfo.message,
       type: messageInfo.message_type as "user" | "assistant",
       files: messageInfo.files,
+      alternateAssistantID: messageInfo.alternate_assistant_id
+        ? Number(messageInfo.alternate_assistant_id)
+        : null,
       // only include these fields if this is an assistant message so that
       // this is identical to what is computed at streaming time
       ...(messageInfo.message_type === "assistant"
@@ -496,8 +503,43 @@ export function removeMessage(
   completeMessageMap.delete(messageId);
 }
 
+export function checkAnyAssistantHasSearch(
+  messageHistory: Message[],
+  availableAssistants: Persona[],
+  livePersona: Persona
+): boolean {
+  const response =
+    messageHistory.some((message) => {
+      if (
+        message.type !== "assistant" ||
+        message.alternateAssistantID === null
+      ) {
+        return false;
+      }
+      const alternateAssistant = availableAssistants.find(
+        (assistant) => assistant.id === message.alternateAssistantID
+      );
+      return alternateAssistant
+        ? personaIncludesRetrieval(alternateAssistant)
+        : false;
+    }) || personaIncludesRetrieval(livePersona);
+
+  return response;
+}
+
 export function personaIncludesRetrieval(selectedPersona: Persona) {
-  return selectedPersona.num_chunks !== 0;
+  return selectedPersona.tools.some(
+    (tool) =>
+      tool.in_code_tool_id &&
+      ["SearchTool", "InternetSearchTool"].includes(tool.in_code_tool_id)
+  );
+}
+
+export function personaIncludesImage(selectedPersona: Persona) {
+  return selectedPersona.tools.some(
+    (tool) =>
+      tool.in_code_tool_id && tool.in_code_tool_id == "ImageGenerationTool"
+  );
 }
 
 const PARAMS_TO_SKIP = [
@@ -512,11 +554,16 @@ const PARAMS_TO_SKIP = [
 export function buildChatUrl(
   existingSearchParams: ReadonlyURLSearchParams,
   chatSessionId: number | null,
-  personaId: number | null
+  personaId: number | null,
+  search?: boolean
 ) {
   const finalSearchParams: string[] = [];
   if (chatSessionId) {
-    finalSearchParams.push(`${SEARCH_PARAM_NAMES.CHAT_ID}=${chatSessionId}`);
+    finalSearchParams.push(
+      `${
+        search ? SEARCH_PARAM_NAMES.SEARCH_ID : SEARCH_PARAM_NAMES.CHAT_ID
+      }=${chatSessionId}`
+    );
   }
   if (personaId !== null) {
     finalSearchParams.push(`${SEARCH_PARAM_NAMES.PERSONA_ID}=${personaId}`);
@@ -530,10 +577,10 @@ export function buildChatUrl(
   const finalSearchParamsString = finalSearchParams.join("&");
 
   if (finalSearchParamsString) {
-    return `/chat?${finalSearchParamsString}`;
+    return `/${search ? "search" : "chat"}?${finalSearchParamsString}`;
   }
 
-  return "/chat";
+  return `/${search ? "search" : "chat"}`;
 }
 
 export async function uploadFilesForChat(
@@ -570,6 +617,7 @@ export async function useScrollonStream({
   endDivRef: RefObject<HTMLDivElement>;
   distance: number;
   debounce: number;
+  mobile?: boolean;
 }) {
   const preventScrollInterference = useRef<boolean>(false);
   const preventScroll = useRef<boolean>(false);

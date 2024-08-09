@@ -44,11 +44,6 @@ class ChatSessionCreationRequest(BaseModel):
     description: str | None = None
 
 
-class HelperResponse(BaseModel):
-    values: dict[str, str]
-    details: list[str] | None = None
-
-
 class CreateChatSessionID(BaseModel):
     chat_session_id: int
 
@@ -90,7 +85,7 @@ class CreateChatMessageRequest(ChunkContext):
     parent_message_id: int | None
     # New message contents
     message: str
-    # file's that we should attach to this message
+    # Files that we should attach to this message
     file_descriptors: list[FileDescriptor]
     # If no prompt provided, uses the largest prompt of the chat session
     # but really this should be explicitly specified, only in the simplified APIs is this inferred
@@ -106,6 +101,9 @@ class CreateChatMessageRequest(ChunkContext):
     # allows the caller to override the Persona / Prompt
     llm_override: LLMOverride | None = None
     prompt_override: PromptOverride | None = None
+
+    # allow user to specify an alternate assistnat
+    alternate_assistant_id: int | None = None
 
     # used for seeded chats to kick off the generation of an AI answer
     use_existing_user_message: bool = False
@@ -168,7 +166,6 @@ class SearchFeedbackRequest(BaseModel):
 
         if click is False and feedback is None:
             raise ValueError("Empty feedback received.")
-
         return values
 
 
@@ -181,7 +178,9 @@ class ChatMessageDetail(BaseModel):
     context_docs: RetrievalDocs | None
     message_type: MessageType
     time_sent: datetime
+    alternate_assistant_id: str | None
     # Dict mapping citation number to db_doc_id
+    chat_session_id: int | None = None
     citations: dict[int, int] | None
     files: list[FileDescriptor]
     tool_calls: list[ToolCallFinalResult]
@@ -190,6 +189,13 @@ class ChatMessageDetail(BaseModel):
         initial_dict = super().dict(*args, **kwargs)  # type: ignore
         initial_dict["time_sent"] = self.time_sent.isoformat()
         return initial_dict
+
+
+class SearchSessionDetailResponse(BaseModel):
+    search_session_id: int
+    description: str
+    documents: list[SearchDoc]
+    messages: list[ChatMessageDetail]
 
 
 class ChatSessionDetailResponse(BaseModel):

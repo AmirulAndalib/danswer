@@ -21,6 +21,10 @@ function PersonaTypeDisplay({ persona }: { persona: Persona }) {
     return <Text>Global</Text>;
   }
 
+  if (persona.groups.length > 0 || persona.users.length > 0) {
+    return <Text>Shared</Text>;
+  }
+
   return <Text>Personal {persona.owner && <>({persona.owner.email})</>}</Text>;
 }
 
@@ -170,7 +174,7 @@ export function PersonasTable({ personas }: { personas: Persona[] }) {
                 </div>
               </div>,
             ],
-            staticModifiers: [[1, "lg:w-[300px] xl:w-[400px] 2xl:w-[550px]"]],
+            staticModifiers: [[1, "lg:w-[250px] xl:w-[400px] 2xl:w-[550px]"]],
           };
         })}
         setRows={updatePersonaOrder}

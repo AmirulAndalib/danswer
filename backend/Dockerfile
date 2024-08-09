@@ -24,7 +24,7 @@ RUN apt-get update && \
         curl \
         zip \
         ca-certificates \
-        libgnutls30=3.7.9-2+deb12u2 \
+        libgnutls30=3.7.9-2+deb12u3 \
         libblkid1=2.38.1-5+deb12u1 \
         libmount1=2.38.1-5+deb12u1 \
         libsmartcols1=2.38.1-5+deb12u1 \
@@ -68,7 +68,9 @@ RUN apt-get update && \
     rm -f /usr/local/lib/python3.11/site-packages/tornado/test/test.key
 
 # Pre-downloading models for setups with limited egress
-RUN python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('intfloat/e5-base-v2')"
+RUN python -c "from tokenizers import Tokenizer; \
+Tokenizer.from_pretrained('nomic-ai/nomic-embed-text-v1')"
+
 
 # Pre-downloading NLTK for setups with limited egress
 RUN python -c "import nltk; \

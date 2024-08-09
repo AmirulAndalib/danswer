@@ -25,6 +25,11 @@ export function CodeBlock({
   const [copied, setCopied] = useState(false);
 
   if (!language) {
+    // this is the case of a single "`" e.g. `hi`
+    if (typeof children === "string") {
+      return <code className={className}>{children}</code>;
+    }
+
     return (
       <pre style={CODE_BLOCK_PADDING_TYPE}>
         <code {...props} className={`text-sm ${className}`}>
@@ -59,9 +64,15 @@ export function CodeBlock({
         codeLines.pop(); // Remove the last line with the trailing backticks
       }
 
-      // remove leading whitespace from each line for nicer copy/paste experience
-      const trimmedCodeLines = codeLines.map((line) => line.trimStart());
-      codeText = trimmedCodeLines.join("\n");
+      const minIndent = codeLines
+        .filter((line) => line.trim().length > 0)
+        .reduce((min, line) => {
+          const match = line.match(/^\s*/);
+          return Math.min(min, match ? match[0].length : 0);
+        }, Infinity);
+
+      const formattedCodeLines = codeLines.map((line) => line.slice(minIndent));
+      codeText = formattedCodeLines.join("\n");
     }
   }
 
@@ -86,7 +97,8 @@ export function CodeBlock({
     codeText = findTextNode(props.node);
   }
 
-  const handleCopy = () => {
+  const handleCopy = (event: React.MouseEvent) => {
+    event.preventDefault();
     if (!codeText) {
       return;
     }
@@ -104,7 +116,7 @@ export function CodeBlock({
         {codeText && (
           <div
             className="ml-auto cursor-pointer select-none"
-            onClick={handleCopy}
+            onMouseDown={handleCopy}
           >
             {copied ? (
               <div className="flex items-center space-x-2">

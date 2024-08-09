@@ -34,6 +34,7 @@ from danswer.configs.app_configs import USER_AUTH_SECRET
 from danswer.configs.app_configs import WEB_DOMAIN
 from danswer.configs.chat_configs import MULTILINGUAL_QUERY_EXPANSION
 from danswer.configs.constants import AuthType
+from danswer.configs.constants import POSTGRES_WEB_APP_NAME
 from danswer.db.connector import create_initial_default_connector
 from danswer.db.connector_credential_pair import associate_default_cc_pair
 from danswer.db.connector_credential_pair import get_connector_credential_pairs
@@ -42,15 +43,19 @@ from danswer.db.credentials import create_initial_public_credential
 from danswer.db.embedding_model import get_current_db_embedding_model
 from danswer.db.embedding_model import get_secondary_db_embedding_model
 from danswer.db.engine import get_sqlalchemy_engine
+from danswer.db.engine import init_sqlalchemy_engine
 from danswer.db.engine import warm_up_connections
 from danswer.db.index_attempt import cancel_indexing_attempts_past_model
 from danswer.db.index_attempt import expire_index_attempts
+from danswer.db.models import EmbeddingModel
 from danswer.db.persona import delete_old_default_personas
+from danswer.db.standard_answer import create_initial_default_standard_answer_category
 from danswer.db.swap_index import check_index_swap
 from danswer.document_index.factory import get_default_document_index
+from danswer.document_index.interfaces import DocumentIndex
 from danswer.llm.llm_initialization import load_llm_providers
+from danswer.natural_language_processing.search_nlp_models import warm_up_encoders
 from danswer.search.retrieval.search_runner import download_nltk_data
-from danswer.search.search_nlp_models import warm_up_encoders
 from danswer.server.auth_check import check_router_auth
 from danswer.server.danswer_api.ingestion import router as danswer_api_router
 from danswer.server.documents.cc_pair import router as cc_pair_router
@@ -59,6 +64,10 @@ from danswer.server.documents.credential import router as credential_router
 from danswer.server.documents.document import router as document_router
 from danswer.server.features.document_set.api import router as document_set_router
 from danswer.server.features.folder.api import router as folder_router
+from danswer.server.features.input_prompt.api import (
+    admin_router as admin_input_prompt_router,
+)
+from danswer.server.features.input_prompt.api import basic_router as input_prompt_router
 from danswer.server.features.persona.api import admin_router as admin_persona_router
 from danswer.server.features.persona.api import basic_router as persona_router
 from danswer.server.features.prompt.api import basic_router as prompt_router
@@ -66,11 +75,14 @@ from danswer.server.features.tool.api import admin_router as admin_tool_router
 from danswer.server.features.tool.api import router as tool_router
 from danswer.server.gpts.api import router as gpts_router
 from danswer.server.manage.administrative import router as admin_router
+from danswer.server.manage.embedding.api import admin_router as embedding_admin_router
+from danswer.server.manage.embedding.api import basic_router as embedding_router
 from danswer.server.manage.get_state import router as state_router
 from danswer.server.manage.llm.api import admin_router as llm_admin_router
 from danswer.server.manage.llm.api import basic_router as llm_router
 from danswer.server.manage.secondary_index import router as secondary_index_router
 from danswer.server.manage.slack_bot import router as slack_bot_management_router
+from danswer.server.manage.standard_answer import router as standard_answer_router
 from danswer.server.manage.users import router as user_router
 from danswer.server.middleware.latency_logging import add_latency_logging_middleware
 from danswer.server.query_and_chat.chat_backend import router as chat_router
@@ -148,8 +160,52 @@ def include_router_with_global_prefix_prepended(
     application.include_router(router, **final_kwargs)
 
 
+def setup_postgres(db_session: Session) -> None:
+    logger.info("Verifying default connector/credential exist.")
+    create_initial_public_credential(db_session)
+    create_initial_default_connector(db_session)
+    associate_default_cc_pair(db_session)
+
+    logger.info("Verifying default standard answer category exists.")
+    create_initial_default_standard_answer_category(db_session)
+
+    logger.info("Loading LLM providers from env variables")
+    load_llm_providers(db_session)
+
+    logger.info("Loading default Prompts and Personas")
+    delete_old_default_personas(db_session)
+    load_chat_yamls()
+
+    logger.info("Loading built-in tools")
+    load_builtin_tools(db_session)
+    refresh_built_in_tools_cache(db_session)
+    auto_add_search_tool_to_personas(db_session)
+
+
+def setup_vespa(
+    document_index: DocumentIndex,
+    db_embedding_model: EmbeddingModel,
+    secondary_db_embedding_model: EmbeddingModel | None,
+) -> None:
+    # Vespa startup is a bit slow, so give it a few seconds
+    wait_time = 5
+    for _ in range(5):
+        try:
+            document_index.ensure_indices_exist(
+                index_embedding_dim=db_embedding_model.model_dim,
+                secondary_index_embedding_dim=secondary_db_embedding_model.model_dim
+                if secondary_db_embedding_model
+                else None,
+            )
+            break
+        except Exception:
+            logger.info(f"Waiting on Vespa, retrying in {wait_time} seconds...")
+            time.sleep(wait_time)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator:
+    init_sqlalchemy_engine(POSTGRES_WEB_APP_NAME)
     engine = get_sqlalchemy_engine()
 
     verify_auth = fetch_versioned_implementation(
@@ -202,23 +258,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         logger.info("Verifying query preprocessing (NLTK) data is downloaded")
         download_nltk_data()
 
-        logger.info("Verifying default connector/credential exist.")
-        create_initial_public_credential(db_session)
-        create_initial_default_connector(db_session)
-        associate_default_cc_pair(db_session)
+        # setup Postgres with default credential, llm providers, etc.
+        setup_postgres(db_session)
 
-        logger.info("Loading LLM providers from env variables")
-        load_llm_providers(db_session)
-
-        logger.info("Loading default Prompts and Personas")
-        delete_old_default_personas(db_session)
-        load_chat_yamls()
-
-        logger.info("Loading built-in tools")
-        load_builtin_tools(db_session)
-        refresh_built_in_tools_cache(db_session)
-        auto_add_search_tool_to_personas(db_session)
-
+        # ensure Vespa is setup correctly
         logger.info("Verifying Document Index(s) is/are available.")
         document_index = get_default_document_index(
             primary_index_name=db_embedding_model.index_name,
@@ -226,28 +269,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             if secondary_db_embedding_model
             else None,
         )
-        # Vespa startup is a bit slow, so give it a few seconds
-        wait_time = 5
-        for attempt in range(5):
-            try:
-                document_index.ensure_indices_exist(
-                    index_embedding_dim=db_embedding_model.model_dim,
-                    secondary_index_embedding_dim=secondary_db_embedding_model.model_dim
-                    if secondary_db_embedding_model
-                    else None,
-                )
-                break
-            except Exception:
-                logger.info(f"Waiting on Vespa, retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
+        setup_vespa(document_index, db_embedding_model, secondary_db_embedding_model)
 
-    logger.info(f"Model Server: http://{MODEL_SERVER_HOST}:{MODEL_SERVER_PORT}")
-    warm_up_encoders(
-        model_name=db_embedding_model.model_name,
-        normalize=db_embedding_model.normalize,
-        model_server_host=MODEL_SERVER_HOST,
-        model_server_port=MODEL_SERVER_PORT,
-    )
+        logger.info(f"Model Server: http://{MODEL_SERVER_HOST}:{MODEL_SERVER_PORT}")
+        if db_embedding_model.cloud_provider_id is None:
+            warm_up_encoders(
+                embedding_model=db_embedding_model,
+                model_server_host=MODEL_SERVER_HOST,
+                model_server_port=MODEL_SERVER_PORT,
+            )
 
     optional_telemetry(record_type=RecordType.VERSION, data={"version": __version__})
     yield
@@ -273,8 +303,11 @@ def get_application() -> FastAPI:
     include_router_with_global_prefix_prepended(
         application, slack_bot_management_router
     )
+    include_router_with_global_prefix_prepended(application, standard_answer_router)
     include_router_with_global_prefix_prepended(application, persona_router)
     include_router_with_global_prefix_prepended(application, admin_persona_router)
+    include_router_with_global_prefix_prepended(application, input_prompt_router)
+    include_router_with_global_prefix_prepended(application, admin_input_prompt_router)
     include_router_with_global_prefix_prepended(application, prompt_router)
     include_router_with_global_prefix_prepended(application, tool_router)
     include_router_with_global_prefix_prepended(application, admin_tool_router)
@@ -285,6 +318,8 @@ def get_application() -> FastAPI:
     include_router_with_global_prefix_prepended(application, settings_admin_router)
     include_router_with_global_prefix_prepended(application, llm_admin_router)
     include_router_with_global_prefix_prepended(application, llm_router)
+    include_router_with_global_prefix_prepended(application, embedding_admin_router)
+    include_router_with_global_prefix_prepended(application, embedding_router)
     include_router_with_global_prefix_prepended(
         application, token_rate_limit_settings_router
     )

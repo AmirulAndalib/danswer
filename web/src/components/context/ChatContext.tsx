@@ -12,17 +12,19 @@ import { ChatSession } from "@/app/chat/interfaces";
 import { Persona } from "@/app/admin/assistants/interfaces";
 import { LLMProviderDescriptor } from "@/app/admin/models/llm/interfaces";
 import { Folder } from "@/app/chat/folders/interfaces";
+import { InputPrompt } from "@/app/admin/prompt-library/interfaces";
 
 interface ChatContextProps {
   user: User | null;
   chatSessions: ChatSession[];
   availableSources: ValidSources[];
   availableDocumentSets: DocumentSet[];
-  availablePersonas: Persona[];
+  availableAssistants: Persona[];
   availableTags: Tag[];
   llmProviders: LLMProviderDescriptor[];
   folders: Folder[];
   openedFolders: Record<string, boolean>;
+  userInputPrompts: InputPrompt[];
 }
 
 const ChatContext = createContext<ChatContextProps | undefined>(undefined);

@@ -1,15 +1,17 @@
 import "./globals.css";
 
-import { Inter } from "next/font/google";
 import { getCombinedSettings } from "@/components/settings/lib";
 import { CUSTOM_ANALYTICS_ENABLED } from "@/lib/constants";
 import { SettingsProvider } from "@/components/settings/SettingsProvider";
 import { Metadata } from "next";
 import { buildClientUrl } from "@/lib/utilsSS";
+import { Inter } from "next/font/google";
+import Head from "next/head";
 
 const inter = Inter({
   subsets: ["latin"],
   variable: "--font-inter",
+  display: "swap",
 });
 
 export async function generateMetadata(): Promise<Metadata> {
@@ -40,6 +42,13 @@ export default async function RootLayout({
 
   return (
     <html lang="en">
+      <Head>
+        <meta
+          name="viewport"
+          content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0, interactive-widget=resizes-content"
+        />
+      </Head>
+
       {CUSTOM_ANALYTICS_ENABLED && combinedSettings.customAnalyticsScript && (
         <head>
           <script
@@ -50,15 +59,18 @@ export default async function RootLayout({
           />
         </head>
       )}
-      <body
-        className={`${inter.variable} font-sans text-default bg-background ${
-          // TODO: remove this once proper dark mode exists
-          process.env.THEME_IS_DARK?.toLowerCase() === "true" ? "dark" : ""
-        }`}
-      >
-        <SettingsProvider settings={combinedSettings}>
-          {children}
-        </SettingsProvider>
+
+      <body className={`relative ${inter.variable} font-sans`}>
+        <div
+          className={`text-default bg-background ${
+            // TODO: remove this once proper dark mode exists
+            process.env.THEME_IS_DARK?.toLowerCase() === "true" ? "dark" : ""
+          }`}
+        >
+          <SettingsProvider settings={combinedSettings}>
+            {children}
+          </SettingsProvider>
+        </div>
       </body>
     </html>
   );

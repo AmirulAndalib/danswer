@@ -6,6 +6,7 @@ import {
   FiAlertTriangle,
   FiCheckCircle,
   FiClock,
+  FiMinus,
   FiPauseCircle,
 } from "react-icons/fi";
 import { HoverPopup } from "./HoverPopup";
@@ -15,7 +16,7 @@ export function IndexAttemptStatus({
   errorMsg,
   size = "md",
 }: {
-  status: ValidStatuses;
+  status: ValidStatuses | null;
   errorMsg?: string | null;
   size?: "xs" | "sm" | "md" | "lg";
 }) {
@@ -32,7 +33,7 @@ export function IndexAttemptStatus({
         <HoverPopup
           mainContent={<div className="cursor-pointer">{icon}</div>}
           popupContent={
-            <div className="flex flex-wrap whitespace-normal w-64">
+            <div className="w-64 p-2 break-words overflow-hidden whitespace-normal">
               {errorMsg}
             </div>
           }
@@ -57,6 +58,12 @@ export function IndexAttemptStatus({
     badge = (
       <Badge size={size} color="fuchsia" icon={FiClock}>
         Scheduled
+      </Badge>
+    );
+  } else {
+    badge = (
+      <Badge size={size} color="gray" icon={FiMinus}>
+        None
       </Badge>
     );
   }

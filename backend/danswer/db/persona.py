@@ -9,11 +9,12 @@ from sqlalchemy import not_
 from sqlalchemy import or_
 from sqlalchemy import select
 from sqlalchemy import update
+from sqlalchemy.orm import selectinload
 from sqlalchemy.orm import Session
 
 from danswer.auth.schemas import UserRole
+from danswer.configs.chat_configs import BING_API_KEY
 from danswer.db.constants import SLACK_BOT_PERSONA_PREFIX
-from danswer.db.document_set import get_document_sets_by_ids
 from danswer.db.engine import get_sqlalchemy_engine
 from danswer.db.models import DocumentSet
 from danswer.db.models import Persona
@@ -24,6 +25,7 @@ from danswer.db.models import StarterMessage
 from danswer.db.models import Tool
 from danswer.db.models import User
 from danswer.db.models import User__UserGroup
+from danswer.db.models import UserGroup
 from danswer.search.enums import RecencyBiasSetting
 from danswer.server.features.persona.models import CreatePersonaRequest
 from danswer.server.features.persona.models import PersonaSnapshot
@@ -62,19 +64,6 @@ def create_update_persona(
 ) -> PersonaSnapshot:
     """Higher level function than upsert_persona, although either is valid to use."""
     # Permission to actually use these is checked later
-    document_sets = list(
-        get_document_sets_by_ids(
-            document_set_ids=create_persona_request.document_set_ids,
-            db_session=db_session,
-        )
-    )
-    prompts = list(
-        get_prompts_by_ids(
-            prompt_ids=create_persona_request.prompt_ids,
-            db_session=db_session,
-        )
-    )
-
     try:
         persona = upsert_persona(
             persona_id=persona_id,
@@ -85,14 +74,17 @@ def create_update_persona(
             llm_relevance_filter=create_persona_request.llm_relevance_filter,
             llm_filter_extraction=create_persona_request.llm_filter_extraction,
             recency_bias=create_persona_request.recency_bias,
-            prompts=prompts,
+            prompt_ids=create_persona_request.prompt_ids,
             tool_ids=create_persona_request.tool_ids,
-            document_sets=document_sets,
+            document_set_ids=create_persona_request.document_set_ids,
             llm_model_provider_override=create_persona_request.llm_model_provider_override,
             llm_model_version_override=create_persona_request.llm_model_version_override,
             starter_messages=create_persona_request.starter_messages,
             is_public=create_persona_request.is_public,
             db_session=db_session,
+            icon_color=create_persona_request.icon_color,
+            icon_shape=create_persona_request.icon_shape,
+            uploaded_image_id=create_persona_request.uploaded_image_id,
         )
 
         versioned_make_persona_private = fetch_versioned_implementation(
@@ -330,17 +322,22 @@ def upsert_persona(
     llm_relevance_filter: bool,
     llm_filter_extraction: bool,
     recency_bias: RecencyBiasSetting,
-    prompts: list[Prompt] | None,
-    document_sets: list[DocumentSet] | None,
     llm_model_provider_override: str | None,
     llm_model_version_override: str | None,
     starter_messages: list[StarterMessage] | None,
     is_public: bool,
     db_session: Session,
+    prompt_ids: list[int] | None = None,
+    document_set_ids: list[int] | None = None,
     tool_ids: list[int] | None = None,
     persona_id: int | None = None,
     default_persona: bool = False,
     commit: bool = True,
+    icon_color: str | None = None,
+    icon_shape: int | None = None,
+    uploaded_image_id: str | None = None,
+    display_priority: int | None = None,
+    is_visible: bool = True,
 ) -> Persona:
     if persona_id is not None:
         persona = db_session.query(Persona).filter_by(id=persona_id).first()
@@ -355,6 +352,28 @@ def upsert_persona(
         tools = db_session.query(Tool).filter(Tool.id.in_(tool_ids)).all()
         if not tools and tool_ids:
             raise ValueError("Tools not found")
+
+    # Fetch and attach document_sets by IDs
+    document_sets = None
+    if document_set_ids is not None:
+        document_sets = (
+            db_session.query(DocumentSet)
+            .filter(DocumentSet.id.in_(document_set_ids))
+            .all()
+        )
+        if not document_sets and document_set_ids:
+            raise ValueError("document_sets not found")
+
+    # Fetch and attach prompts by IDs
+    prompts = None
+    if prompt_ids is not None:
+        prompts = db_session.query(Prompt).filter(Prompt.id.in_(prompt_ids)).all()
+        if not prompts and prompt_ids:
+            raise ValueError("prompts not found")
+
+    # ensure all specified tools are valid
+    if tools:
+        validate_persona_tools(tools)
 
     if persona:
         if not default_persona and persona.default_persona:
@@ -374,6 +393,11 @@ def upsert_persona(
         persona.starter_messages = starter_messages
         persona.deleted = False  # Un-delete if previously deleted
         persona.is_public = is_public
+        persona.icon_color = icon_color
+        persona.icon_shape = icon_shape
+        persona.uploaded_image_id = uploaded_image_id
+        persona.display_priority = display_priority
+        persona.is_visible = is_visible
 
         # Do not delete any associations manually added unless
         # a new updated list is provided
@@ -383,10 +407,10 @@ def upsert_persona(
 
         if prompts is not None:
             persona.prompts.clear()
-            persona.prompts = prompts
+            persona.prompts = prompts or []
 
         if tools is not None:
-            persona.tools = tools
+            persona.tools = tools or []
 
     else:
         persona = Persona(
@@ -406,6 +430,11 @@ def upsert_persona(
             llm_model_version_override=llm_model_version_override,
             starter_messages=starter_messages,
             tools=tools or [],
+            icon_shape=icon_shape,
+            icon_color=icon_color,
+            uploaded_image_id=uploaded_image_id,
+            display_priority=display_priority,
+            is_visible=is_visible,
         )
         db_session.add(persona)
 
@@ -451,6 +480,14 @@ def update_persona_visibility(
     persona = get_persona_by_id(persona_id=persona_id, user=None, db_session=db_session)
     persona.is_visible = is_visible
     db_session.commit()
+
+
+def validate_persona_tools(tools: list[Tool]) -> None:
+    for tool in tools:
+        if tool.name == "InternetSearchTool" and not BING_API_KEY:
+            raise ValueError(
+                "Bing API key not found, please contact your Danswer admin to get it added!"
+            )
 
 
 def check_user_can_edit_persona(user: User | None, persona: Persona) -> None:
@@ -531,6 +568,8 @@ def get_default_prompt__read_only() -> Prompt:
         return _get_default_prompt(db_session)
 
 
+# TODO: since this gets called with every chat message, could it be more efficient to pregenerate
+# a direct mapping indicating whether a user has access to a specific persona?
 def get_persona_by_id(
     persona_id: int,
     # if user is `None` assume the user is an admin or auth is disabled
@@ -539,16 +578,38 @@ def get_persona_by_id(
     include_deleted: bool = False,
     is_for_edit: bool = True,  # NOTE: assume true for safety
 ) -> Persona:
-    stmt = select(Persona).where(Persona.id == persona_id)
+    stmt = (
+        select(Persona)
+        .options(selectinload(Persona.users), selectinload(Persona.groups))
+        .where(Persona.id == persona_id)
+    )
 
     or_conditions = []
 
     # if user is an admin, they should have access to all Personas
+    # and will skip the following clause
     if user is not None and user.role != UserRole.ADMIN:
-        or_conditions.extend([Persona.user_id == user.id, Persona.user_id.is_(None)])
+        # the user is not an admin
+        isPersonaUnowned = Persona.user_id.is_(
+            None
+        )  # allow access if persona user id is None
+        isUserCreator = (
+            Persona.user_id == user.id
+        )  # allow access if user created the persona
+        or_conditions.extend([isPersonaUnowned, isUserCreator])
 
-        # if we aren't editing, also give access to all public personas
+        # if we aren't editing, also give access if:
+        # 1. the user is authorized for this persona
+        # 2. the user is in an authorized group for this persona
+        # 3. if the persona is public
         if not is_for_edit:
+            isSharedWithUser = Persona.users.any(
+                id=user.id
+            )  # allow access if user is in allowed users
+            isSharedWithGroup = Persona.groups.any(
+                UserGroup.users.any(id=user.id)
+            )  # allow access if user is in any allowed group
+            or_conditions.extend([isSharedWithUser, isSharedWithGroup])
             or_conditions.append(Persona.is_public.is_(True))
 
     if or_conditions:
