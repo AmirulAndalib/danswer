@@ -279,7 +279,10 @@ def connector_permission_sync_generator_task(
 
     try:
         with get_session_with_tenant(tenant_id) as db_session:
-            cc_pair = get_connector_credential_pair_from_id(cc_pair_id, db_session)
+            cc_pair = get_connector_credential_pair_from_id(
+                db_session=db_session,
+                cc_pair_id=cc_pair_id,
+            )
             if cc_pair is None:
                 raise ValueError(
                     f"No connector credential pair found for id: {cc_pair_id}"
@@ -391,5 +394,7 @@ def update_external_document_permissions_task(
             )
         return True
     except Exception:
-        logger.exception("Error Syncing Document Permissions")
+        logger.exception(
+            f"Error Syncing Document Permissions: connector_id={connector_id} doc_id={doc_id}"
+        )
         return False

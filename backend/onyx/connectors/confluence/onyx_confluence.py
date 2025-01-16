@@ -135,32 +135,6 @@ class OnyxConfluence(Confluence):
         super(OnyxConfluence, self).__init__(url, *args, **kwargs)
         self._wrap_methods()
 
-    def get_current_user(self, expand: str | None = None) -> Any:
-        """
-        Implements a method that isn't in the third party client.
-
-        Get information about the current user
-        :param expand: OPTIONAL expand for get status of user.
-                Possible param is "status". Results are "Active, Deactivated"
-        :return: Returns the user details
-        """
-
-        from atlassian.errors import ApiPermissionError  # type:ignore
-
-        url = "rest/api/user/current"
-        params = {}
-        if expand:
-            params["expand"] = expand
-        try:
-            response = self.get(url, params=params)
-        except HTTPError as e:
-            if e.response.status_code == 403:
-                raise ApiPermissionError(
-                    "The calling user does not have permission", reason=e
-                )
-            raise
-        return response
-
     def _wrap_methods(self) -> None:
         """
         For each attribute that is callable (i.e., a method) and doesn't start with an underscore,
@@ -353,6 +327,62 @@ class OnyxConfluence(Confluence):
         """
         group_name = quote(group_name)
         yield from self._paginate_url(f"rest/api/group/{group_name}/member", limit)
+
+    def get_all_space_permissions_server(
+        self,
+        space_key: str,
+    ) -> list[dict[str, Any]]:
+        """
+        This is a confluence server specific method that can be used to
+        fetch the permissions of a space.
+        This is better logging than calling the get_space_permissions method
+        because it returns a jsonrpc response.
+        TODO: Make this call these endpoints for newer confluence versions:
+        - /rest/api/space/{spaceKey}/permissions
+        - /rest/api/space/{spaceKey}/permissions/anonymous
+        """
+        url = "rpc/json-rpc/confluenceservice-v2"
+        data = {
+            "jsonrpc": "2.0",
+            "method": "getSpacePermissionSets",
+            "id": 7,
+            "params": [space_key],
+        }
+        response = self.post(url, data=data)
+        logger.debug(f"jsonrpc response: {response}")
+        if not response.get("result"):
+            logger.warning(
+                f"No jsonrpc response for space permissions for space {space_key}"
+                f"\nResponse: {response}"
+            )
+
+        return response.get("result", [])
+
+    def get_current_user(self, expand: str | None = None) -> Any:
+        """
+        Implements a method that isn't in the third party client.
+
+        Get information about the current user
+        :param expand: OPTIONAL expand for get status of user.
+                Possible param is "status". Results are "Active, Deactivated"
+        :return: Returns the user details
+        """
+
+        from atlassian.errors import ApiPermissionError  # type:ignore
+
+        url = "rest/api/user/current"
+        params = {}
+        if expand:
+            params["expand"] = expand
+        try:
+            response = self.get(url, params=params)
+        except HTTPError as e:
+            if e.response.status_code == 403:
+                raise ApiPermissionError(
+                    "The calling user does not have permission", reason=e
+                )
+            raise
+        return response
 
 
 def _validate_connector_configuration(
