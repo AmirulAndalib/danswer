@@ -10,6 +10,7 @@ from onyx.auth.users import current_admin_user
 from onyx.auth.users import current_chat_accesssible_user
 from onyx.db.engine import get_session
 from onyx.db.llm import fetch_existing_llm_providers
+from onyx.db.llm import fetch_existing_llm_providers_for_user
 from onyx.db.llm import fetch_provider
 from onyx.db.llm import remove_llm_provider
 from onyx.db.llm import update_default_provider
@@ -142,19 +143,20 @@ def put_llm_provider(
             detail=f"LLM Provider with name {llm_provider.name} already exists",
         )
 
-    # Ensure default_model_name and fast_default_model_name are in display_model_names
-    # This is necessary for custom models and Bedrock/Azure models
-    if llm_provider.display_model_names is None:
-        llm_provider.display_model_names = []
+    if llm_provider.display_model_names is not None:
+        # Ensure default_model_name and fast_default_model_name are in display_model_names
+        # This is necessary for custom models and Bedrock/Azure models
+        if llm_provider.default_model_name not in llm_provider.display_model_names:
+            llm_provider.display_model_names.append(llm_provider.default_model_name)
 
-    if llm_provider.default_model_name not in llm_provider.display_model_names:
-        llm_provider.display_model_names.append(llm_provider.default_model_name)
-
-    if (
-        llm_provider.fast_default_model_name
-        and llm_provider.fast_default_model_name not in llm_provider.display_model_names
-    ):
-        llm_provider.display_model_names.append(llm_provider.fast_default_model_name)
+        if (
+            llm_provider.fast_default_model_name
+            and llm_provider.fast_default_model_name
+            not in llm_provider.display_model_names
+        ):
+            llm_provider.display_model_names.append(
+                llm_provider.fast_default_model_name
+            )
 
     try:
         return upsert_llm_provider(
@@ -194,5 +196,7 @@ def list_llm_provider_basics(
 ) -> list[LLMProviderDescriptor]:
     return [
         LLMProviderDescriptor.from_model(llm_provider_model)
-        for llm_provider_model in fetch_existing_llm_providers(db_session, user)
+        for llm_provider_model in fetch_existing_llm_providers_for_user(
+            db_session, user
+        )
     ]

@@ -18,12 +18,14 @@ from onyx.db.engine import get_session_with_tenant
 from onyx.db.engine import SYNC_DB_API
 from onyx.db.search_settings import get_current_search_settings
 from onyx.db.swap_index import check_index_swap
+from onyx.document_index.document_index_utils import get_multipass_config
 from onyx.document_index.vespa.index import DOCUMENT_ID_ENDPOINT
 from onyx.document_index.vespa.index import VespaIndex
 from onyx.indexing.models import IndexingSetting
 from onyx.setup import setup_postgres
 from onyx.setup import setup_vespa
 from onyx.utils.logger import setup_logger
+from tests.integration.common_utils.timeout import run_with_timeout
 
 logger = setup_logger()
 
@@ -63,57 +65,53 @@ def _run_migrations(
     logging.getLogger("alembic").setLevel(logging.INFO)
 
 
-def reset_postgres(
-    database: str = "postgres", config_name: str = "alembic", setup_onyx: bool = True
+def downgrade_postgres(
+    database: str = "postgres",
+    schema: str = "public",
+    config_name: str = "alembic",
+    revision: str = "base",
+    clear_data: bool = False,
 ) -> None:
-    """Reset the Postgres database."""
+    """Downgrade Postgres database to base state."""
+    if clear_data:
+        if revision != "base":
+            raise ValueError("Clearing data without rolling back to base state")
 
-    # NOTE: need to delete all rows to allow migrations to be rolled back
-    # as there are a few downgrades that don't properly handle data in tables
-    conn = psycopg2.connect(
-        dbname=database,
-        user=POSTGRES_USER,
-        password=POSTGRES_PASSWORD,
-        host=POSTGRES_HOST,
-        port=POSTGRES_PORT,
-    )
-    cur = conn.cursor()
+        conn = psycopg2.connect(
+            dbname=database,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+        )
+        conn.autocommit = True  # Need autocommit for dropping schema
+        cur = conn.cursor()
 
-    # Disable triggers to prevent foreign key constraints from being checked
-    cur.execute("SET session_replication_role = 'replica';")
-
-    # Fetch all table names in the current database
-    cur.execute(
+        # Close any existing connections to the schema before dropping
+        cur.execute(
+            f"""
+            SELECT pg_terminate_backend(pg_stat_activity.pid)
+            FROM pg_stat_activity
+            WHERE pg_stat_activity.datname = '{database}'
+            AND pg_stat_activity.state = 'idle in transaction'
+            AND pid <> pg_backend_pid();
         """
-        SELECT tablename
-        FROM pg_tables
-        WHERE schemaname = 'public'
-    """
-    )
+        )
 
-    tables = cur.fetchall()
+        # Drop and recreate the public schema - this removes ALL objects
+        cur.execute(f"DROP SCHEMA {schema} CASCADE;")
+        cur.execute(f"CREATE SCHEMA {schema};")
 
-    for table in tables:
-        table_name = table[0]
+        # Restore default privileges
+        cur.execute(f"GRANT ALL ON SCHEMA {schema} TO postgres;")
+        cur.execute(f"GRANT ALL ON SCHEMA {schema} TO public;")
 
-        # Don't touch migration history
-        if table_name == "alembic_version":
-            continue
+        cur.close()
+        conn.close()
 
-        # Don't touch Kombu
-        if table_name == "kombu_message" or table_name == "kombu_queue":
-            continue
+        return
 
-        cur.execute(f'DELETE FROM "{table_name}"')
-
-    # Re-enable triggers
-    cur.execute("SET session_replication_role = 'origin';")
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    # downgrade to base + upgrade back to head
+    # Downgrade to base
     conn_str = build_connection_string(
         db=database,
         user=POSTGRES_USER,
@@ -126,20 +124,69 @@ def reset_postgres(
         conn_str,
         config_name,
         direction="downgrade",
-        revision="base",
+        revision=revision,
+    )
+
+
+def upgrade_postgres(
+    database: str = "postgres", config_name: str = "alembic", revision: str = "head"
+) -> None:
+    """Upgrade Postgres database to latest version."""
+    conn_str = build_connection_string(
+        db=database,
+        user=POSTGRES_USER,
+        password=POSTGRES_PASSWORD,
+        host=POSTGRES_HOST,
+        port=POSTGRES_PORT,
+        db_api=SYNC_DB_API,
     )
     _run_migrations(
         conn_str,
         config_name,
         direction="upgrade",
-        revision="head",
+        revision=revision,
     )
-    if not setup_onyx:
-        return
 
-    # do the same thing as we do on API server startup
-    with get_session_context_manager() as db_session:
-        setup_postgres(db_session)
+
+def reset_postgres(
+    database: str = "postgres",
+    config_name: str = "alembic",
+    setup_onyx: bool = True,
+) -> None:
+    """Reset the Postgres database."""
+    # this seems to hang due to locking issues, so run with a timeout with a few retries
+    NUM_TRIES = 10
+    TIMEOUT = 10
+    success = False
+    for _ in range(NUM_TRIES):
+        logger.info(f"Downgrading Postgres... ({_ + 1}/{NUM_TRIES})")
+        try:
+            run_with_timeout(
+                downgrade_postgres,
+                TIMEOUT,
+                kwargs={
+                    "database": database,
+                    "config_name": config_name,
+                    "revision": "base",
+                    "clear_data": True,
+                },
+            )
+            success = True
+            break
+        except TimeoutError:
+            logger.warning(
+                f"Postgres downgrade timed out, retrying... ({_ + 1}/{NUM_TRIES})"
+            )
+
+    if not success:
+        raise RuntimeError("Postgres downgrade failed after 10 timeouts.")
+
+    logger.info("Upgrading Postgres...")
+    upgrade_postgres(database=database, config_name=config_name, revision="head")
+    if setup_onyx:
+        logger.info("Setting up Postgres...")
+        with get_session_context_manager() as db_session:
+            setup_postgres(db_session)
 
 
 def reset_vespa() -> None:
@@ -150,10 +197,16 @@ def reset_vespa() -> None:
         check_index_swap(db_session)
 
         search_settings = get_current_search_settings(db_session)
+        multipass_config = get_multipass_config(search_settings)
         index_name = search_settings.index_name
 
     success = setup_vespa(
-        document_index=VespaIndex(index_name=index_name, secondary_index_name=None),
+        document_index=VespaIndex(
+            index_name=index_name,
+            secondary_index_name=None,
+            large_chunks_enabled=multipass_config.enable_large_chunks,
+            secondary_large_chunks_enabled=None,
+        ),
         index_setting=IndexingSetting.from_db_model(search_settings),
         secondary_index_setting=None,
     )
@@ -212,6 +265,18 @@ def reset_postgres_multitenant() -> None:
         schema_name = schema[0]
         cur.execute(f'DROP SCHEMA "{schema_name}" CASCADE')
 
+    # Drop tables in the public schema
+    cur.execute(
+        """
+        SELECT tablename FROM pg_tables
+        WHERE schemaname = 'public'
+        """
+    )
+    public_tables = cur.fetchall()
+    for table in public_tables:
+        table_name = table[0]
+        cur.execute(f'DROP TABLE IF EXISTS public."{table_name}" CASCADE')
+
     cur.close()
     conn.close()
 
@@ -227,10 +292,16 @@ def reset_vespa_multitenant() -> None:
             check_index_swap(db_session)
 
             search_settings = get_current_search_settings(db_session)
+            multipass_config = get_multipass_config(search_settings)
             index_name = search_settings.index_name
 
         success = setup_vespa(
-            document_index=VespaIndex(index_name=index_name, secondary_index_name=None),
+            document_index=VespaIndex(
+                index_name=index_name,
+                secondary_index_name=None,
+                large_chunks_enabled=multipass_config.enable_large_chunks,
+                secondary_large_chunks_enabled=None,
+            ),
             index_setting=IndexingSetting.from_db_model(search_settings),
             secondary_index_setting=None,
         )
