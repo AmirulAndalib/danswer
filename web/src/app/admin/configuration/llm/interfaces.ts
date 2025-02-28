@@ -10,6 +10,9 @@ import {
   OpenAIIcon,
   GeminiIcon,
   OpenSourceIcon,
+  AnthropicSVG,
+  IconProps,
+  OpenAIISVG,
 } from "@/components/icons/icons";
 import { FaRobot } from "react-icons/fa";
 
@@ -73,37 +76,44 @@ export interface LLMProviderDescriptor {
 }
 
 export const getProviderIcon = (providerName: string, modelName?: string) => {
+  const modelNameToIcon = (
+    modelName: string,
+    fallbackIcon: ({ size, className }: IconProps) => JSX.Element
+  ): (({ size, className }: IconProps) => JSX.Element) => {
+    if (modelName?.toLowerCase().includes("amazon")) {
+      return AmazonIcon;
+    }
+    if (modelName?.toLowerCase().includes("phi")) {
+      return MicrosoftIconSVG;
+    }
+    if (modelName?.toLowerCase().includes("mistral")) {
+      return MistralIcon;
+    }
+    if (modelName?.toLowerCase().includes("llama")) {
+      return MetaIcon;
+    }
+    if (modelName?.toLowerCase().includes("gemini")) {
+      return GeminiIcon;
+    }
+    if (modelName?.toLowerCase().includes("claude")) {
+      return AnthropicIcon;
+    } else {
+      return fallbackIcon;
+    }
+  };
+
   switch (providerName) {
     case "openai":
       // Special cases for openai based on modelName
-      if (modelName?.toLowerCase().includes("amazon")) {
-        return AmazonIcon;
-      }
-      if (modelName?.toLowerCase().includes("phi")) {
-        return MicrosoftIconSVG;
-      }
-      if (modelName?.toLowerCase().includes("mistral")) {
-        return MistralIcon;
-      }
-      if (modelName?.toLowerCase().includes("llama")) {
-        return MetaIcon;
-      }
-      if (modelName?.toLowerCase().includes("gemini")) {
-        return GeminiIcon;
-      }
-      if (modelName?.toLowerCase().includes("claude")) {
-        return AnthropicIcon;
-      }
-
-      return OpenAIIcon; // Default for openai
+      return modelNameToIcon(modelName || "", OpenAIISVG);
     case "anthropic":
-      return AnthropicIcon;
+      return AnthropicSVG;
     case "bedrock":
       return AWSIcon;
     case "azure":
       return AzureIcon;
     default:
-      return CPUIcon;
+      return modelNameToIcon(modelName || "", CPUIcon);
   }
 };
 

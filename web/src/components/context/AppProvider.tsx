@@ -1,6 +1,7 @@
+"use client";
 import { CombinedSettings } from "@/app/admin/settings/interfaces";
 import { UserProvider } from "../user/UserProvider";
-import { ProviderContextProvider } from "../chat_search/ProviderContext";
+import { ProviderContextProvider } from "../chat/ProviderContext";
 import { SettingsProvider } from "../settings/SettingsProvider";
 import { AssistantsProvider } from "./AssistantsContext";
 import { Persona } from "@/app/admin/assistants/interfaces";
@@ -24,9 +25,9 @@ export const AppProvider = ({
   hasImageCompatibleModel,
 }: AppProviderProps) => {
   return (
-    <UserProvider user={user}>
-      <ProviderContextProvider>
-        <SettingsProvider settings={settings}>
+    <SettingsProvider settings={settings}>
+      <UserProvider settings={settings} user={user}>
+        <ProviderContextProvider>
           <AssistantsProvider
             initialAssistants={assistants}
             hasAnyConnectors={hasAnyConnectors}
@@ -34,8 +35,8 @@ export const AppProvider = ({
           >
             {children}
           </AssistantsProvider>
-        </SettingsProvider>
-      </ProviderContextProvider>
-    </UserProvider>
+        </ProviderContextProvider>
+      </UserProvider>
+    </SettingsProvider>
   );
 };

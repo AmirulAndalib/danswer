@@ -5,7 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import InvitedUserTable from "@/components/admin/users/InvitedUserTable";
 import SignedUpUserTable from "@/components/admin/users/SignedUpUserTable";
-import { SearchBar } from "@/components/search/SearchBar";
+
 import { FiPlusSquare } from "react-icons/fi";
 import { Modal } from "@/components/Modal";
 import { ThreeDotsLoader } from "@/components/Loading";
@@ -18,6 +18,9 @@ import { ErrorCallout } from "@/components/ErrorCallout";
 import BulkAdd from "@/components/admin/users/BulkAdd";
 import Text from "@/components/ui/text";
 import { InvitedUserSnapshot } from "@/lib/types";
+import { SearchBar } from "@/components/search/SearchBar";
+import { ConfirmEntityModal } from "@/components/modals/ConfirmEntityModal";
+import { NEXT_PUBLIC_CLOUD_ENABLED } from "@/lib/constants";
 
 const UsersTables = ({
   q,
@@ -77,7 +80,6 @@ const UsersTables = ({
           </CardContent>
         </Card>
       </TabsContent>
-
       <TabsContent value="invited">
         <Card>
           <CardHeader>
@@ -130,6 +132,13 @@ const AddUserButton = ({
   setPopup: (spec: PopupSpec) => void;
 }) => {
   const [modal, setModal] = useState(false);
+  const [showConfirmation, setShowConfirmation] = useState(false);
+
+  const { data: invitedUsers } = useSWR<InvitedUserSnapshot[]>(
+    "/api/manage/users/invited",
+    errorHandlingFetcher
+  );
+
   const onSuccess = () => {
     mutate(
       (key) => typeof key === "string" && key.startsWith("/api/manage/users")
@@ -140,6 +149,7 @@ const AddUserButton = ({
       type: "success",
     });
   };
+
   const onFailure = async (res: Response) => {
     const error = (await res.json()).detail;
     setPopup({
@@ -147,14 +157,44 @@ const AddUserButton = ({
       type: "error",
     });
   };
+
+  const handleInviteClick = () => {
+    if (
+      !NEXT_PUBLIC_CLOUD_ENABLED &&
+      invitedUsers &&
+      invitedUsers.length === 0
+    ) {
+      setShowConfirmation(true);
+    } else {
+      setModal(true);
+    }
+  };
+
+  const handleConfirmFirstInvite = () => {
+    setShowConfirmation(false);
+    setModal(true);
+  };
+
   return (
     <>
-      <Button className="my-auto w-fit" onClick={() => setModal(true)}>
+      <Button className="my-auto w-fit" onClick={handleInviteClick}>
         <div className="flex">
           <FiPlusSquare className="my-auto mr-2" />
           Invite Users
         </div>
       </Button>
+
+      {showConfirmation && (
+        <ConfirmEntityModal
+          entityType="First User Invitation"
+          entityName="your Access Logic"
+          onClose={() => setShowConfirmation(false)}
+          onSubmit={handleConfirmFirstInvite}
+          additionalDetails="After inviting the first user, only invited users will be able to join this platform. This is a security measure to control access to your instance."
+          actionButtonText="Continue"
+          variant="action"
+        />
+      )}
 
       {modal && (
         <Modal title="Bulk Add Users" onOutsideClick={() => setModal(false)}>

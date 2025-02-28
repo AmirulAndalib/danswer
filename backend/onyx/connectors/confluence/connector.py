@@ -4,18 +4,27 @@ from datetime import timezone
 from typing import Any
 from urllib.parse import quote
 
+from requests.exceptions import HTTPError
+
 from onyx.configs.app_configs import CONFLUENCE_CONNECTOR_LABELS_TO_SKIP
 from onyx.configs.app_configs import CONFLUENCE_TIMEZONE_OFFSET
 from onyx.configs.app_configs import CONTINUE_ON_CONNECTOR_FAILURE
 from onyx.configs.app_configs import INDEX_BATCH_SIZE
 from onyx.configs.constants import DocumentSource
-from onyx.connectors.confluence.onyx_confluence import build_confluence_client
+from onyx.connectors.confluence.onyx_confluence import attachment_to_content
+from onyx.connectors.confluence.onyx_confluence import (
+    extract_text_from_confluence_html,
+)
 from onyx.connectors.confluence.onyx_confluence import OnyxConfluence
-from onyx.connectors.confluence.utils import attachment_to_content
 from onyx.connectors.confluence.utils import build_confluence_document_id
 from onyx.connectors.confluence.utils import datetime_from_string
-from onyx.connectors.confluence.utils import extract_text_from_confluence_html
 from onyx.connectors.confluence.utils import validate_attachment_filetype
+from onyx.connectors.exceptions import ConnectorValidationError
+from onyx.connectors.exceptions import CredentialExpiredError
+from onyx.connectors.exceptions import InsufficientPermissionsError
+from onyx.connectors.exceptions import UnexpectedError
+from onyx.connectors.interfaces import CredentialsConnector
+from onyx.connectors.interfaces import CredentialsProviderInterface
 from onyx.connectors.interfaces import GenerateDocumentsOutput
 from onyx.connectors.interfaces import GenerateSlimDocumentOutput
 from onyx.connectors.interfaces import LoadConnector
@@ -27,6 +36,7 @@ from onyx.connectors.models import ConnectorMissingCredentialError
 from onyx.connectors.models import Document
 from onyx.connectors.models import Section
 from onyx.connectors.models import SlimDocument
+from onyx.indexing.indexing_heartbeat import IndexingHeartbeatInterface
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -76,7 +86,9 @@ _FULL_EXTENSION_FILTER_STRING = "".join(
 )
 
 
-class ConfluenceConnector(LoadConnector, PollConnector, SlimConnector):
+class ConfluenceConnector(
+    LoadConnector, PollConnector, SlimConnector, CredentialsConnector
+):
     def __init__(
         self,
         wiki_base: str,
@@ -95,7 +107,6 @@ class ConfluenceConnector(LoadConnector, PollConnector, SlimConnector):
     ) -> None:
         self.batch_size = batch_size
         self.continue_on_failure = continue_on_failure
-        self._confluence_client: OnyxConfluence | None = None
         self.is_cloud = is_cloud
 
         # Remove trailing slash from wiki_base if present
@@ -130,6 +141,19 @@ class ConfluenceConnector(LoadConnector, PollConnector, SlimConnector):
             self.cql_label_filter = f" and label not in ({comma_separated_labels})"
 
         self.timezone: timezone = timezone(offset=timedelta(hours=timezone_offset))
+        self.credentials_provider: CredentialsProviderInterface | None = None
+
+        self.probe_kwargs = {
+            "max_backoff_retries": 6,
+            "max_backoff_seconds": 10,
+        }
+
+        self.final_kwargs = {
+            "max_backoff_retries": 10,
+            "max_backoff_seconds": 60,
+        }
+
+        self._confluence_client: OnyxConfluence | None = None
 
     @property
     def confluence_client(self) -> OnyxConfluence:
@@ -137,15 +161,22 @@ class ConfluenceConnector(LoadConnector, PollConnector, SlimConnector):
             raise ConnectorMissingCredentialError("Confluence")
         return self._confluence_client
 
-    def load_credentials(self, credentials: dict[str, Any]) -> dict[str, Any] | None:
-        # see https://github.com/atlassian-api/atlassian-python-api/blob/master/atlassian/rest_client.py
-        # for a list of other hidden constructor args
-        self._confluence_client = build_confluence_client(
-            credentials=credentials,
-            is_cloud=self.is_cloud,
-            wiki_base=self.wiki_base,
+    def set_credentials_provider(
+        self, credentials_provider: CredentialsProviderInterface
+    ) -> None:
+        self.credentials_provider = credentials_provider
+
+        # raises exception if there's a problem
+        confluence_client = OnyxConfluence(
+            self.is_cloud, self.wiki_base, credentials_provider
         )
-        return None
+        confluence_client._probe_connection(**self.probe_kwargs)
+        confluence_client._initialize_connection(**self.final_kwargs)
+
+        self._confluence_client = confluence_client
+
+    def load_credentials(self, credentials: dict[str, Any]) -> dict[str, Any] | None:
+        raise NotImplementedError("Use set_credentials_provider with this connector.")
 
     def _construct_page_query(
         self,
@@ -195,12 +226,17 @@ class ConfluenceConnector(LoadConnector, PollConnector, SlimConnector):
         return comment_string
 
     def _convert_object_to_document(
-        self, confluence_object: dict[str, Any]
+        self,
+        confluence_object: dict[str, Any],
+        parent_content_id: str | None = None,
     ) -> Document | None:
         """
         Takes in a confluence object, extracts all metadata, and converts it into a document.
         If its a page, it extracts the text, adds the comments for the document text.
         If its an attachment, it just downloads the attachment and converts that into a document.
+
+        parent_content_id: if the object is an attachment, specifies the content id that
+        the attachment is attached to
         """
         # The url and the id are the same
         object_url = build_confluence_document_id(
@@ -219,7 +255,9 @@ class ConfluenceConnector(LoadConnector, PollConnector, SlimConnector):
             object_text += self._get_comment_string_for_page_id(confluence_object["id"])
         elif confluence_object["type"] == "attachment":
             object_text = attachment_to_content(
-                confluence_client=self.confluence_client, attachment=confluence_object
+                confluence_client=self.confluence_client,
+                attachment=confluence_object,
+                parent_content_id=parent_content_id,
             )
 
         if object_text is None:
@@ -232,20 +270,29 @@ class ConfluenceConnector(LoadConnector, PollConnector, SlimConnector):
         }
 
         # Get labels
-        label_dicts = confluence_object["metadata"]["labels"]["results"]
-        page_labels = [label["name"] for label in label_dicts]
+        label_dicts = (
+            confluence_object.get("metadata", {}).get("labels", {}).get("results", [])
+        )
+        page_labels = [label.get("name") for label in label_dicts if label.get("name")]
         if page_labels:
             doc_metadata["labels"] = page_labels
 
         # Get last modified and author email
-        last_modified = datetime_from_string(confluence_object["version"]["when"])
-        author_email = confluence_object["version"].get("by", {}).get("email")
+        version_dict = confluence_object.get("version", {})
+        last_modified = (
+            datetime_from_string(version_dict.get("when"))
+            if version_dict.get("when")
+            else None
+        )
+        author_email = version_dict.get("by", {}).get("email")
+
+        title = confluence_object.get("title", "Untitled Document")
 
         return Document(
             id=object_url,
             sections=[Section(link=object_url, text=object_text)],
             source=DocumentSource.CONFLUENCE,
-            semantic_identifier=confluence_object["title"],
+            semantic_identifier=title,
             doc_updated_at=last_modified,
             primary_owners=(
                 [BasicExpertInfo(email=author_email)] if author_email else None
@@ -286,7 +333,7 @@ class ConfluenceConnector(LoadConnector, PollConnector, SlimConnector):
                 cql=attachment_query,
                 expand=",".join(_ATTACHMENT_EXPANSION_FIELDS),
             ):
-                doc = self._convert_object_to_document(attachment)
+                doc = self._convert_object_to_document(attachment, confluence_page_id)
                 if doc is not None:
                     doc_batch.append(doc)
                 if len(doc_batch) >= self.batch_size:
@@ -310,6 +357,7 @@ class ConfluenceConnector(LoadConnector, PollConnector, SlimConnector):
         self,
         start: SecondsSinceUnixEpoch | None = None,
         end: SecondsSinceUnixEpoch | None = None,
+        callback: IndexingHeartbeatInterface | None = None,
     ) -> GenerateSlimDocumentOutput:
         doc_metadata_list: list[SlimDocument] = []
 
@@ -377,4 +425,42 @@ class ConfluenceConnector(LoadConnector, PollConnector, SlimConnector):
                 yield doc_metadata_list[:_SLIM_DOC_BATCH_SIZE]
                 doc_metadata_list = doc_metadata_list[_SLIM_DOC_BATCH_SIZE:]
 
+                if callback:
+                    if callback.should_stop():
+                        raise RuntimeError(
+                            "retrieve_all_slim_documents: Stop signal detected"
+                        )
+
+                    callback.progress("retrieve_all_slim_documents", 1)
+
         yield doc_metadata_list
+
+    def validate_connector_settings(self) -> None:
+        if self._confluence_client is None:
+            raise ConnectorMissingCredentialError("Confluence credentials not loaded.")
+
+        try:
+            spaces = self._confluence_client.get_all_spaces(limit=1)
+        except HTTPError as e:
+            status_code = e.response.status_code if e.response else None
+            if status_code == 401:
+                raise CredentialExpiredError(
+                    "Invalid or expired Confluence credentials (HTTP 401)."
+                )
+            elif status_code == 403:
+                raise InsufficientPermissionsError(
+                    "Insufficient permissions to access Confluence resources (HTTP 403)."
+                )
+            raise UnexpectedError(
+                f"Unexpected Confluence error (status={status_code}): {e}"
+            )
+        except Exception as e:
+            raise UnexpectedError(
+                f"Unexpected error while validating Confluence settings: {e}"
+            )
+
+        if not spaces or not spaces.get("results"):
+            raise ConnectorValidationError(
+                "No Confluence spaces found. Either your credentials lack permissions, or "
+                "there truly are no spaces in this Confluence instance."
+            )
