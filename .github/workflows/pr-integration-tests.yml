@@ -21,7 +21,13 @@ env:
 jobs:
   integration-tests:
     # See https://runs-on.com/runners/linux/
-    runs-on: [runs-on, runner=32cpu-linux-x64, "run-id=${{ github.run_id }}"]
+    runs-on:
+      [
+        runs-on,
+        runner=32cpu-linux-x64,
+        disk=large,
+        "run-id=${{ github.run_id }}",
+      ]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -147,6 +153,8 @@ jobs:
             -e POSTGRES_HOST=relational_db \
             -e POSTGRES_USER=postgres \
             -e POSTGRES_PASSWORD=password \
+            -e DB_READONLY_USER=db_readonly_user \
+            -e DB_READONLY_PASSWORD=password \
             -e POSTGRES_DB=postgres \
             -e POSTGRES_USE_NULL_POOL=true \
             -e VESPA_HOST=index \
@@ -245,6 +253,8 @@ jobs:
             -e POSTGRES_HOST=relational_db \
             -e POSTGRES_USER=postgres \
             -e POSTGRES_PASSWORD=password \
+            -e DB_READONLY_USER=db_readonly_user \
+            -e DB_READONLY_PASSWORD=password \
             -e POSTGRES_DB=postgres \
             -e POSTGRES_POOL_PRE_PING=true \
             -e POSTGRES_USE_NULL_POOL=true \

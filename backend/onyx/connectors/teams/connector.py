@@ -1,8 +1,10 @@
 import copy
 import os
+import time
 from collections.abc import Iterator
 from datetime import datetime
 from datetime import timezone
+from http import HTTPStatus
 from typing import Any
 from typing import cast
 
@@ -32,7 +34,6 @@ from onyx.connectors.models import EntityFailure
 from onyx.connectors.models import TextSection
 from onyx.file_processing.html_utils import parse_html_page_basic
 from onyx.utils.logger import setup_logger
-from onyx.utils.threadpool_concurrency import parallel_yield
 from onyx.utils.threadpool_concurrency import run_with_timeout
 
 logger = setup_logger()
@@ -192,7 +193,8 @@ class TeamsConnector(
             team=team,
         )
 
-        docs = [
+        # An iterator of channels, in which each channel is an iterator of docs.
+        channels_docs = [
             _collect_documents_for_channel(
                 graph_client=self.graph_client,
                 team=team,
@@ -203,12 +205,13 @@ class TeamsConnector(
             for channel in channels
         ]
 
-        for doc in parallel_yield(
-            gens=docs,
-            max_workers=self.max_workers,
-        ):
-            if doc:
-                yield doc
+        # Was previously `for doc in parallel_yield(gens=docs, max_workers=self.max_workers): ...`.
+        # However, that lead to some weird exceptions (potentially due to non-thread-safe behaviour in the Teams library).
+        # Reverting back to the non-threaded case for now.
+        for channel_docs in channels_docs:
+            for channel_doc in channel_docs:
+                if channel_doc:
+                    yield channel_doc
 
         logger.info(
             f"Processed team with id {todo_team_id}; {len(todos)} team(s) left to process"
@@ -492,7 +495,41 @@ def _collect_documents_for_channel(
             continue
 
         try:
-            replies = list(message.replies.get_all().execute_query())
+            MAX_RETRIES = 10
+            retries = 0
+            replies: list[ChatMessage] | None = None
+            cre: ClientRequestException | None = None
+
+            while retries < MAX_RETRIES:
+                try:
+                    replies = list(message.replies.get_all().execute_query())
+                    cre = None
+                    break
+
+                except ClientRequestException as e:
+                    cre = e
+
+                    if not cre.response:
+                        break
+                    if cre.response.status_code != int(HTTPStatus.TOO_MANY_REQUESTS):
+                        break
+
+                    retry_after = int(cre.response.headers.get("Retry-After", 10))
+                    time.sleep(retry_after)
+                    retries += 1
+
+            if cre or replies is None:
+                failure_message = f"Retrieval of message and its replies failed; {channel.id=} {message.id=}"
+                if cre and cre.response:
+                    failure_message = f"{failure_message}; {cre.response.status_code=}"
+
+                yield ConnectorFailure(
+                    failed_entity=EntityFailure(entity_id=message.id),
+                    failure_message=failure_message,
+                    exception=cre,
+                )
+                continue
+
             thread = [message]
             thread.extend(replies[::-1])
 
